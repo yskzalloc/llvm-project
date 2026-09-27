@@ -32,11 +32,11 @@ entry:
 ; CHECK-LABEL: define i32 @use_pair(
 ; CHECK-NOT: alloca
 ; CHECK: %[[LO:[0-9]+]] = zext i32 %2 to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @use_pair to i64), i32 0, i32 4, i64 %[[LO]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %[[LO]], ptr null, i32 0)
 ; CHECK: %[[HI:[0-9]+]] = zext i32 %4 to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @use_pair to i64), i32 0, i32 4, i64 %[[HI]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %[[HI]], ptr null, i32 0)
 ; CHECK: %[[Z:[0-9]+]] = zext i32 %1 to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @use_pair to i64), i32 1, i32 4, i64 %[[Z]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 1, i32 4, i64 %[[Z]], ptr null, i32 0)
 
 ; A fragment whose location is an expression that *computes* the value - here a
 ; field shifted out of a wider register - is not a value that can be reported,
@@ -57,9 +57,9 @@ entry:
 }
 ; CHECK-LABEL: define i32 @use_trio(
 ; CHECK: %[[A:[0-9]+]] = zext i32 %2 to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @use_trio to i64), i32 0, i32 4, i64 %[[A]], ptr null, i32 0)
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @use_trio to i64), i32 0, i32 8, i64 %3, ptr null, i32 0)
-; CHECK-NOT: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @use_trio to i64), i32 1
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %[[A]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 8, i64 %3, ptr null, i32 0)
+; CHECK-NOT: call void @__sanitizer_cov_trace_args(i32 1
 
 ; void use_big(struct big b) passed indirectly: the parameter is a pointer to
 ; the caller's copy, described by the struct's own type, so it is reported as
@@ -71,7 +71,7 @@ entry:
 }
 ; CHECK-LABEL: define void @use_big(
 ; CHECK: %[[ADDR:[0-9]+]] = ptrtoint ptr %0 to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @use_big to i64), i32 0, i32 40, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 5)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 40, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 5)
 
 !llvm.dbg.cu = !{!0}
 !llvm.module.flags = !{!1, !2}

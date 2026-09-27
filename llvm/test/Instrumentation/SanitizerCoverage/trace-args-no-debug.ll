@@ -20,9 +20,9 @@ entry:
 ; CHECK-LABEL: define void @no_debug(
 ; With no type to describe its pointee, a pointer is reported as its own value.
 ; CHECK: %[[P:[0-9]+]] = ptrtoint ptr %p to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @no_debug to i64), i32 0, i32 8, i64 %[[P]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 8, i64 %[[P]], ptr null, i32 0)
 ; CHECK: %[[X:[0-9]+]] = zext i32 %x to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @no_debug to i64), i32 1, i32 4, i64 %[[X]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 1, i32 4, i64 %[[X]], ptr null, i32 0)
 
 ; A struct-return pointer is ABI-inserted and has no source-level counterpart,
 ; so it is skipped here as well and %x keeps index 0.
@@ -31,5 +31,5 @@ entry:
   ret void
 }
 ; CHECK-LABEL: define void @no_debug_sret(
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @no_debug_sret to i64), i32 0, i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
-; CHECK-NOT: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @no_debug_sret to i64), i32 1
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
+; CHECK-NOT: call void @__sanitizer_cov_trace_args(i32 1

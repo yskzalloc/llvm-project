@@ -21,7 +21,7 @@ entry:
 }
 ; CHECK-LABEL: define ptr @ret_struct_ptr(
 ; CHECK: %[[ADDR:[0-9]+]] = ptrtoint ptr %s to i64
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_struct_ptr to i64), i32 16, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 2)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 16, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 2)
 ; CHECK: ret ptr %s
 
 ; A scalar return is reported as its value, once per return.
@@ -35,9 +35,9 @@ no:
 }
 ; CHECK-LABEL: define i32 @ret_scalar(
 ; CHECK: %[[X:[0-9]+]] = zext i32 %x to i64
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_scalar to i64), i32 4, i64 %[[X]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 4, i64 %[[X]], ptr null, i32 0)
 ; CHECK: ret i32 %x
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_scalar to i64), i32 4, i64 0, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 4, i64 0, ptr null, i32 0)
 ; CHECK: ret i32 0
 
 ; A struct returned by value may be lowered to an indirect return: the IR
@@ -50,7 +50,7 @@ entry:
 }
 ; CHECK-LABEL: define void @ret_sret(
 ; CHECK: %[[BUF:[0-9]+]] = ptrtoint ptr %0 to i64
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_sret to i64), i32 24, i64 %[[BUF]], ptr @__sancov_offsets_.1, i32 3)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 24, i64 %[[BUF]], ptr @__sancov_offsets_.1, i32 3)
 ; CHECK: ret void
 
 ; A struct small enough to come back in registers has no address, so it is
@@ -65,8 +65,8 @@ entry:
 ; CHECK-LABEL: define { i64, i64 } @ret_in_registers(
 ; CHECK: %[[LO:[0-9]+]] = extractvalue { i64, i64 } %1, 0
 ; CHECK: %[[HI:[0-9]+]] = extractvalue { i64, i64 } %1, 1
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_in_registers to i64), i32 8, i64 %[[LO]], ptr null, i32 0)
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_in_registers to i64), i32 8, i64 %[[HI]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 8, i64 %[[LO]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 8, i64 %[[HI]], ptr null, i32 0)
 
 ; A void return has nothing to report.
 define void @ret_void() !dbg !22 {
@@ -74,7 +74,7 @@ entry:
   ret void
 }
 ; CHECK-LABEL: define void @ret_void(
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_void to i64), i32 0, i64 0, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 0, i64 0, ptr null, i32 0)
 ; CHECK: ret void
 
 ; A musttail call has to stay adjacent to the return that forwards it, so there
@@ -86,7 +86,7 @@ entry:
   ret i32 %r
 }
 ; CHECK-LABEL: define i32 @ret_musttail(
-; CHECK-NOT: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @ret_musttail to i64)
+; CHECK-NOT: call void @__sanitizer_cov_trace_ret(
 ; CHECK: ret i32 %r
 
 !llvm.dbg.cu = !{!0}
