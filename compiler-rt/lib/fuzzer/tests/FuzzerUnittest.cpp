@@ -1424,6 +1424,52 @@ TEST(Entropic, ComputeEnergy) {
   EXPECT_LT(SubAndSquare(II->Energy, 1.792831), Precision);
 }
 
+// trace-args/trace-ret values reach the value profile as features of the site
+// they were observed at; an object or pointee snapshot by field, and a null
+// address - a dereferenceable_or_null pointer may be one - without a read.
+TEST(TracePC, HandleDataflow) {
+  auto Features = [] {
+    size_t N = 0;
+    TPC.CollectFeatures([&](uint32_t) { N++; });
+    return N;
+  };
+  TPC.ResetMaps();
+  TPC.SetUseValueProfileMask(1);
+  size_t None = Features();
+
+  // A size of zero is nothing to observe.
+  TPC.HandleDataflow(0x1000, 0, 0, 42, nullptr, 0);
+  EXPECT_EQ(Features(), None);
+
+  // A value, then the same value again: one feature.
+  TPC.HandleDataflow(0x1000, 0, 8, 42, nullptr, 0);
+  size_t Value = Features();
+  EXPECT_GT(Value, None);
+  TPC.HandleDataflow(0x1000, 0, 8, 42, nullptr, 0);
+  EXPECT_EQ(Features(), Value);
+
+  // The same value at another site, or as another argument, is another one.
+  TPC.HandleDataflow(0x2000, 0, 8, 42, nullptr, 0);
+  TPC.HandleDataflow(0x2000, 1, 8, 42, nullptr, 0);
+  size_t Sites = Features();
+  EXPECT_GT(Sites, Value);
+
+  // An object by address: each field read and folded on its own.
+  uint64_t Object[2] = {7, 9};
+  const uint64_t Offsets[4] = {0, 8, 8, 8};
+  TPC.HandleDataflow(0x3000, 0, 16, reinterpret_cast<uintptr_t>(Object),
+                     Offsets, 2);
+  size_t Fields = Features();
+  EXPECT_GE(Fields, Sites + 2);
+
+  // A null address with a table of fields: folded as a null value, nothing
+  // read (reading would fault).
+  TPC.HandleDataflow(0x4000, 0, 16, 0, Offsets, 2);
+  EXPECT_GT(Features(), Fields);
+  TPC.ResetMaps();
+  TPC.SetUseValueProfileMask(0);
+}
+
 int main(int argc, char **argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

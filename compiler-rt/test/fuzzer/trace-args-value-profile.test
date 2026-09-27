@@ -1,0 +1,14 @@
+REQUIRES: linux
+With trace-args and trace-ret, and nothing else that depends on the input
+instrumented, the values reported become value-profile features: inputs that
+give Fold() new argument, pointee or return values are new coverage under
+-use_value_profile=1 - hundreds of them - while without it only the few new
+edges of a longer input are.
+RUN: %cpp_compiler -fsanitize-coverage=trace-args,trace-ret -fno-sanitize-coverage=trace-cmp \
+RUN:   %S/TraceArgsValueProfileTest.cpp -o %t-TraceArgsValueProfileTest
+RUN: %run %t-TraceArgsValueProfileTest -seed=1 -runs=2000 -use_value_profile=1 -use_cmp=0 -print_final_stats=1 2>&1 \
+RUN:   | FileCheck %s --check-prefix=VP
+RUN: %run %t-TraceArgsValueProfileTest -seed=1 -runs=2000 -use_value_profile=0 -use_cmp=0 -print_final_stats=1 2>&1 \
+RUN:   | FileCheck %s --check-prefix=NOVP
+VP:   stat::new_units_added: {{[1-9][0-9][0-9]+$}}
+NOVP: stat::new_units_added: {{[0-3]$}}
