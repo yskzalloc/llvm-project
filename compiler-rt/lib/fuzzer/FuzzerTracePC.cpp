@@ -365,6 +365,54 @@ void TracePC::HandleCmp(uintptr_t PC, T Arg1, T Arg2) {
   ValueProfileMap.AddValue(PC * 128 + 64 + AbsoluteDistance);
 }
 
+// A struct with more fields than this contributes only its first ones, to bound
+// the work done on every call.
+static const uint32_t kMaxDataflowFields = 32;
+
+ATTRIBUTE_NO_SANITIZE_ALL
+void TracePC::HandleDataflow(uintptr_t PC, uint32_t Loc, uint32_t Size,
+                             uint64_t Val, const uint64_t *Offsets,
+                             uint32_t NumFields) {
+  // A void return, or a value the instrumentation could not report, carries
+  // no value to observe.
+  if (!Size)
+    return;
+  // Bind the value to the site it was observed at - the function, the argument
+  // or return position, and the field - so that the same value seen elsewhere
+  // stays a distinct observation, then fold it into the value profile: a value
+  // never seen at that site before becomes a new feature. Only
+  // -use_value_profile consumes this.
+  auto Fold = [&](uint32_t Field, uint64_t V) {
+    ValueProfileMap.AddValueModPrime((PC * 3 + Loc) ^ (Field * 0x9E3779B1u) ^
+                                     V);
+  };
+
+  if (!NumFields || !Offsets) {
+    Fold(0, Val);
+    return;
+  }
+  // Val is the address of an object and Offsets holds {byte offset, byte size}
+  // pairs, one per field of it: an object in memory, or the bytes a pointer the
+  // IR says is dereferenceable points to. A dereferenceable_or_null pointer may
+  // be null, and is then folded as one. Field numbers start at one to stay
+  // distinct from a whole value.
+  const uint8_t *Object =
+      reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(Val));
+  if (!Object) {
+    Fold(0, 0);
+    return;
+  }
+  for (uint32_t I = 0; I < NumFields && I < kMaxDataflowFields; I++) {
+    uint64_t Bytes = Offsets[I * 2 + 1];
+    if (Bytes > sizeof(uint64_t))
+      Bytes = sizeof(uint64_t);
+    uint64_t Field = 0;
+    __builtin_memcpy(&Field, Object + Offsets[I * 2],
+                     static_cast<size_t>(Bytes));
+    Fold(I + 1, Field);
+  }
+}
+
 ATTRIBUTE_NO_SANITIZE_MEMORY
 static size_t InternalStrnlen(const char *S, size_t MaxLen) {
   size_t Len = 0;
@@ -457,6 +505,33 @@ ATTRIBUTE_TARGET_POPCNT
 void __sanitizer_cov_trace_cmp8(uint64_t Arg1, uint64_t Arg2) {
   uintptr_t PC = reinterpret_cast<uintptr_t>(GET_CALLER_PC());
   fuzzer::TPC.HandleCmp(PC, Arg1, Arg2);
+}
+
+// Argument and return value tracing (-fsanitize-coverage=trace-args,trace-ret).
+// The instrumentation does not pass a PC: like the cmp callbacks these take
+// their own return address, less one so that it lies within the call rather
+// than on the instruction after it. Every observation - each IR argument, each
+// element of a first-class aggregate, each return - has a call site of its own,
+// so the PC identifies it. The observed value is folded into the value
+// profile.
+ATTRIBUTE_INTERFACE
+ATTRIBUTE_NO_SANITIZE_ALL
+void __sanitizer_cov_trace_args(uint32_t ArgIdx, uint32_t Size, uint64_t Val,
+                                const uint64_t *Offsets, uint32_t NumFields) {
+  uintptr_t PC = reinterpret_cast<uintptr_t>(GET_CALLER_PC()) - 1;
+  fuzzer::TPC.HandleDataflow(PC, ArgIdx, Size, Val, Offsets, NumFields);
+}
+
+ATTRIBUTE_INTERFACE
+ATTRIBUTE_NO_SANITIZE_ALL
+void __sanitizer_cov_trace_ret(uint32_t Size, uint64_t Val,
+                               const uint64_t *Offsets, uint32_t NumFields) {
+  uintptr_t PC = reinterpret_cast<uintptr_t>(GET_CALLER_PC()) - 1;
+  // A return has its own call site, so it cannot collide with the arguments of
+  // the same function; the distinct location only keeps the value profile from
+  // mixing a return value into an argument's counters.
+  const uint32_t kReturnLoc = 0xFFFF;
+  fuzzer::TPC.HandleDataflow(PC, kReturnLoc, Size, Val, Offsets, NumFields);
 }
 
 ATTRIBUTE_INTERFACE
