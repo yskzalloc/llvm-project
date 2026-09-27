@@ -253,6 +253,10 @@ SanitizerCoverageOptions OverrideFromCL(SanitizerCoverageOptions Options) {
   return Options;
 }
 
+/// One source-level frame of a function's code; defined with the argument
+/// tracing below.
+struct InlineFrame;
+
 class ModuleSanitizerCoverage {
 public:
   using DomTreeCallback = function_ref<const DominatorTree &(Function &F)>;
@@ -283,7 +287,8 @@ private:
   void InjectTraceForLoadsAndStores(Function &F, ArrayRef<LoadInst *> Loads,
                                     ArrayRef<StoreInst *> Stores);
   void InjectTraceForExits(Function &F);
-  void InjectTraceForArgs(Function &F);
+  void InjectTraceForArgs(Function &F, const DominatorTree &DT);
+  void injectTraceForFrame(Function &F, InlineFrame &Frame);
   void InjectTraceForRet(Function &F);
   void InjectTraceForSwitch(Function &F,
                             ArrayRef<Instruction *> SwitchTraceTargets,
@@ -580,15 +585,15 @@ bool ModuleSanitizerCoverage::instrumentModule() {
 
   // See the "Argument and return value tracing" section below for the meaning
   // of the arguments.
-  // void __sanitizer_cov_trace_args(u64 pc, u32 arg_idx, u32 size, u64 val,
+  // void __sanitizer_cov_trace_args(u32 arg_idx, u32 size, u64 val,
   //                                 u64 *offsets, u32 num_fields)
   SanCovTraceArgsFunc =
-      M.getOrInsertFunction(SanCovTraceArgsName, VoidTy, Int64Ty, Int32Ty,
-                            Int32Ty, Int64Ty, PtrTy, Int32Ty);
-  // void __sanitizer_cov_trace_ret(u64 pc, u32 size, u64 val,
+      M.getOrInsertFunction(SanCovTraceArgsName, VoidTy, Int32Ty, Int32Ty,
+                            Int64Ty, PtrTy, Int32Ty);
+  // void __sanitizer_cov_trace_ret(u32 size, u64 val,
   //                                u64 *offsets, u32 num_fields)
-  SanCovTraceRetFunc = M.getOrInsertFunction(
-      SanCovTraceRetName, VoidTy, Int64Ty, Int32Ty, Int64Ty, PtrTy, Int32Ty);
+  SanCovTraceRetFunc = M.getOrInsertFunction(SanCovTraceRetName, VoidTy,
+                                             Int32Ty, Int64Ty, PtrTy, Int32Ty);
 
   SanCovStackDepthCallback =
       M.getOrInsertFunction(SanCovStackDepthCallbackName, VoidTy);
@@ -817,7 +822,7 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
     InjectTraceForExits(F);
 
   if (Options.TraceArgs)
-    InjectTraceForArgs(F);
+    InjectTraceForArgs(F, DT);
 
   if (Options.TraceRet)
     InjectTraceForRet(F);
@@ -1329,13 +1334,21 @@ void ModuleSanitizerCoverage::createFunctionControlFlow(Function &F) {
 // instrumented function on entry, -sanitizer-coverage-trace-ret reports the
 // value of every return:
 //
-//   void __sanitizer_cov_trace_args(u64 pc, u32 arg_idx, u32 size, u64 val,
+//   void __sanitizer_cov_trace_args(u32 arg_idx, u32 size, u64 val,
 //                                   u64 *offsets, u32 num_fields);
-//   void __sanitizer_cov_trace_ret (u64 pc, u32 size, u64 val,
+//   void __sanitizer_cov_trace_ret (u32 size, u64 val,
 //                                   u64 *offsets, u32 num_fields);
 //
-// `pc` is the address of the instrumented function. What `val` holds depends on
-// `num_fields`:
+// Neither callback is told which function it speaks for. The call site is that
+// answer: a runtime reads its own return address, as the other callbacks in
+// this family already do, and the frame the address falls in is described by
+// the debug information the call carries. This is what lets the pass report a
+// callee the inliner merged into its caller - such a callee has no symbol and
+// no entry address of its own by the time this pass runs, but it does have an
+// address range inside the caller and a DW_TAG_inlined_subroutine naming it.
+// See findInlineFrames().
+//
+// What `val` holds depends on `num_fields`:
 //
 // - `num_fields == 0`: `val` is the value itself, the low `size` bytes of it,
 //   zero-extended. Integers, pointers and floating-point values are reported
@@ -1353,12 +1366,14 @@ void ModuleSanitizerCoverage::createFunctionControlFlow(Function &F) {
 // `size == 0` means the pass had nothing to report - a parameter the optimizer
 // removed, a value of a type it cannot widen, a void return.
 //
-// `arg_idx` is the zero-based *source-level* parameter index. Argument values
-// are recovered from debug records rather than from the IR argument list,
-// because the two disagree as soon as the ABI rewrites the signature; see
-// collectSourceParams(). A function without debug records falls back to the IR
-// argument list, which keeps both modes usable on code built without -g, at
-// the price of exposing the ABI's view of the arguments.
+// `arg_idx` is the zero-based *source-level* parameter index, numbered within
+// the frame the record belongs to. Argument values are recovered from debug
+// records rather than from the IR argument list, because the two disagree as
+// soon as the ABI rewrites the signature; see collectInlineFrames(). A
+// function without debug records falls back to the IR argument list, which
+// keeps both modes usable on code built without -g, at the price of exposing
+// the ABI's view of the arguments and of seeing only the function itself,
+// since an inlined frame is only visible through debug information.
 
 /// Peel the typedefs and qualifiers off \p Ty to reach the type they decorate.
 static DIType *stripTypedefsAndQualifiers(DIType *Ty) {
@@ -1477,7 +1492,7 @@ struct SourceParam {
   DIType *Ty = nullptr;
   SmallVector<ValuePiece, 2> Pieces;
   /// Whether Pieces holds fragments of the parameter rather than the whole of
-  /// it. A parameter can lose a fragment (see collectSourceParams), so the
+  /// it. A parameter can lose a fragment (see collectInlineFrames), so the
   /// number of pieces alone does not answer this.
   bool Fragmented = false;
   /// Whether Pieces holds incoming Arguments rather than derived values.
@@ -1507,36 +1522,149 @@ struct SourceParam {
 
 using SourceParamMap = SmallDenseMap<unsigned, SourceParam, 8>;
 
+/// A source-level frame in the code of the function being instrumented: the
+/// function's own body, or a callee the inliner merged into it.
+///
+/// @InlinedAt is the call site the frame's code was inlined at, null for the
+/// function's own body, and identifies the frame by itself: one callee inlined
+/// at two call sites is two frames, each reported from its own copy of the
+/// code. @SP is the subprogram whose parameters the frame reports, which for an
+/// inlined frame is the callee's and not the instrumented function's.
+struct InlineFrame {
+  DISubprogram *SP = nullptr;
+  DILocation *InlinedAt = nullptr;
+  /// Where the frame's parameters are reported: the first instruction the
+  /// frame owns, so that the call lands in the frame's own address range and
+  /// the debug location it carries describes the frame.
+  BasicBlock::iterator Start;
+  SourceParamMap Params;
+};
+
 } // namespace
 
-/// Map the source-level parameters of \p F to the values that hold them on
-/// entry, keyed by the DWARF parameter number (counted from 1).
+/// The frame \p I belongs to: the call site its location was inlined at, or
+/// null for code the instrumented function wrote itself. An instruction the
+/// optimizer left without a location is treated as the function's own, which
+/// is where it will be attributed in the debug line table too.
+static DILocation *frameOf(const Instruction &I) {
+  DebugLoc DL = I.getDebugLoc();
+  return DL ? DL.getInlinedAt() : nullptr;
+}
+
+/// The earliest point in \p I's block at which a call may be inserted at or
+/// after \p I. PHI nodes and EH pads have to stay at the top of a block, so an
+/// instruction among them cannot itself be an insertion point. Returns the
+/// block's end() for a block that admits no call at all, as one headed by a
+/// catchswitch does.
+static BasicBlock::iterator legalInsertionPt(Instruction &I) {
+  BasicBlock *BB = I.getParent();
+  BasicBlock::iterator First = BB->getFirstInsertionPt();
+  if (First == BB->end())
+    return First;
+  return I.comesBefore(&*First) ? First : I.getIterator();
+}
+
+/// Collect the frames of \p F together with the values that hold each frame's
+/// source-level parameters on entry, keyed by the DWARF parameter number
+/// (counted from 1).
+///
+/// \p F's own body is always the first frame. Every callee the inliner merged
+/// into \p F is a frame of its own, discovered from the call site its code was
+/// inlined at. Reporting those frames is what keeps trace-args complete
+/// without having to suppress inlining: by the time this pass runs an inlined
+/// callee has no symbol and no entry address left, but its code still occupies
+/// an address range inside \p F that debug information describes.
 ///
 /// The frontend numbers parameters, in DILocalVariable::getArg(), before ABI
 /// lowering, so the number keeps naming the same source parameter even when
 /// the ABI inserts a hidden argument or splits an aggregate across several.
 /// Debug records are the only link back to that numbering, which is why they,
-/// and not the IR argument list, drive trace-args.
+/// and not the IR argument list, drive trace-args; for an inlined frame they
+/// are the only description of the parameters that is left at all.
 ///
-/// A parameter is left out of \p Params when it has no location the trace call
+/// A parameter is left out of its frame when it has no location the trace call
 /// can use; the caller reports those with a null value pointer.
-static void collectSourceParams(Function &F, SourceParamMap &Params) {
+static void collectInlineFrames(Function &F, const DominatorTree &DT,
+                                SmallVectorImpl<InlineFrame> &Frames) {
   BasicBlock &EntryBB = F.getEntryBlock();
-  DISubprogram *SP = F.getSubprogram();
+  BasicBlock::iterator EntryIP = EntryBB.getFirstInsertionPt();
+  // A function whose entry block admits no call cannot be reported at all.
+  if (EntryIP == EntryBB.end())
+    return;
+
+  // The own body comes first, so a function's own parameters are reported
+  // ahead of those of anything inlined into it.
+  Frames.push_back({F.getSubprogram(), nullptr, EntryIP, {}});
+
+  DenseMap<DILocation *, unsigned> ByCallSite;
+  SmallVector<std::pair<DILocation *, DISubprogram *>, 4> Chain;
+  for (Instruction &I : instructions(F)) {
+    DebugLoc DL = I.getDebugLoc();
+    if (!DL || !DL.getInlinedAt())
+      continue;
+
+    // An instruction of a callee inlined into a callee lies in the address
+    // range of every frame on the way out, so it can report all of them. This
+    // is also what recovers a frame whose own code the optimizer folded away
+    // while leaving the code it had inlined behind - common for a small
+    // wrapper around a larger callee.
+    //
+    // The report goes where this instruction is, so settle that first: a
+    // block that cannot take a call has nothing to offer any of the frames.
+    BasicBlock::iterator Start = legalInsertionPt(I);
+    if (Start == I.getParent()->end())
+      continue;
+    // The entry block is shared with the function's own prologue, whose
+    // insertion point the own frame already uses; do not report ahead of it.
+    if (Start->getParent() == &EntryBB && Start->comesBefore(&*EntryIP))
+      Start = EntryIP;
+
+    // Walk out through the inline chain. Each step names one frame: the call
+    // site is the key, and the scope on the inner side of that call site is
+    // the subprogram whose parameters the frame reports.
+    Chain.clear();
+    for (DILocation *Cur = DL.get(); DILocation *At = Cur->getInlinedAt();
+         Cur = At) {
+      DILocalScope *Scope = Cur->getScope();
+      if (DISubprogram *SP = Scope ? Scope->getSubprogram() : nullptr)
+        Chain.emplace_back(At, SP);
+    }
+
+    // Outermost first, so that a caller's parameters are reported ahead of
+    // those of the callees inlined into it.
+    for (auto [At, SP] : reverse(Chain)) {
+      auto [It, Inserted] = ByCallSite.try_emplace(At, Frames.size());
+      if (Inserted)
+        Frames.push_back({SP, At, Start, {}});
+    }
+  }
 
   for (Instruction &I : instructions(F)) {
     for (DbgVariableRecord &DVR : filterDbgVars(I.getDbgRecordRange())) {
       DILocalVariable *Var = DVR.getVariable();
       if (!Var || !Var->getArg())
         continue;
-      // Only this function's own parameters are numbered for us. An inlined
-      // callee's parameters are numbered too, and its records may name our
-      // Arguments: kmalloc(size, flags) inlined into f(ptr, size) leaves
-      // #dbg_value(%size, "size", arg: 1) behind, which would otherwise be
-      // taken as a description of f's first parameter.
-      if (DVR.getDebugLoc() && DVR.getDebugLoc().getInlinedAt())
-        continue;
-      if (SP && Var->getScope() && Var->getScope()->getSubprogram() != SP)
+
+      // A record belongs to the frame its location was inlined into, and has
+      // to describe a parameter of that frame's subprogram. This is what keeps
+      // the parameter numbering of the frames apart: kmalloc(size, flags)
+      // inlined into f(ptr, size) leaves #dbg_value(%size, "size", arg: 1)
+      // behind, which belongs to kmalloc's frame and is not a description of
+      // f's first parameter.
+      DILocation *InlinedAt =
+          DVR.getDebugLoc() ? DVR.getDebugLoc().getInlinedAt() : nullptr;
+      unsigned FrameIdx = 0;
+      if (InlinedAt) {
+        auto It = ByCallSite.find(InlinedAt);
+        // A frame whose every instruction was optimized away has nowhere its
+        // parameters could be reported from.
+        if (It == ByCallSite.end())
+          continue;
+        FrameIdx = It->second;
+      }
+      InlineFrame &Frame = Frames[FrameIdx];
+      if (!Frame.SP || !Var->getScope() ||
+          Var->getScope()->getSubprogram() != Frame.SP)
         continue;
       // A #dbg_declare names the parameter's storage rather than its incoming
       // value. That storage is written by the prologue, which follows the trace
@@ -1565,12 +1693,19 @@ static void collectSourceParams(Function &F, SourceParamMap &Params) {
       // Debug records are exempt from SSA dominance, so a record may name a
       // value that is not available where the trace call goes. Reporting it
       // would produce IR failing the verifier with "Instruction does not
-      // dominate all uses".
-      if (auto *Def = dyn_cast<Instruction>(V))
-        if (Def->getParent() != &EntryBB || Def->isTerminator())
+      // dominate all uses". A value the frame itself defines further down its
+      // first block is still usable, because the call moves past it and stays
+      // within the frame; see injectTraceForFrame().
+      if (auto *Def = dyn_cast<Instruction>(V)) {
+        if (Def->isTerminator())
           continue;
+        if (!DT.dominates(Def, &*Frame.Start) &&
+            !(Def->getParent() == Frame.Start->getParent() &&
+              frameOf(*Def) == Frame.InlinedAt))
+          continue;
+      }
 
-      SourceParam &Param = Params[Var->getArg()];
+      SourceParam &Param = Frame.Params[Var->getArg()];
       Param.Ty = Var->getType();
       Param.addPiece(V, Fragment ? Fragment->OffsetInBits : 0,
                      Fragment.has_value());
@@ -1636,35 +1771,63 @@ getReportedValues(IRBuilderBase &IRB, Value *V,
     Out.emplace_back(nullptr, 0);
 }
 
-void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
-  DISubprogram *SP = F.getSubprogram();
-  BasicBlock &EntryBB = F.getEntryBlock();
+void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F,
+                                                 const DominatorTree &DT) {
+  SmallVector<InlineFrame, 4> Frames;
+  collectInlineFrames(F, DT, Frames);
 
-  SourceParamMap Params;
-  collectSourceParams(F, Params);
+  // In source order: the function's own parameters first, then those of each
+  // callee inlined into it, in the order their code appears.
+  for (InlineFrame &Frame : Frames)
+    injectTraceForFrame(F, Frame);
+}
 
-  // Trace as early as the reported values allow: at the first insertion point
-  // of the entry block, pushed down past the definition of every value that is
-  // reported so that it dominates the call.
-  BasicBlock::iterator IP = EntryBB.getFirstInsertionPt();
-  for (const auto &[Idx, Param] : Params)
+/// Report the parameters of one frame of \p F, from inside that frame's code.
+void ModuleSanitizerCoverage::injectTraceForFrame(Function &F,
+                                                  InlineFrame &Frame) {
+  // Trace as early as the reported values allow: at the frame's first
+  // instruction, pushed down past the definition of every value that is
+  // reported so that it dominates the call. collectInlineFrames() only keeps a
+  // definition the call can move past without leaving the frame, so the call
+  // still lands in the frame's own address range.
+  BasicBlock::iterator IP = Frame.Start;
+  for (const auto &[Idx, Param] : Frame.Params)
     for (const auto &[V, BitOffset] : Param.Pieces)
-      if (auto *Def = dyn_cast<Instruction>(V); Def && !Def->comesBefore(&*IP))
+      if (auto *Def = dyn_cast<Instruction>(V);
+          Def && Def->getParent() == IP->getParent() &&
+          !Def->comesBefore(&*IP))
         IP = std::next(Def->getIterator());
+
+  // A reported value can itself be a PHI, and the instruction after a PHI may
+  // be another one: inserting there would leave the call in the middle of the
+  // block's PHIs, which the verifier rejects with "PHI nodes not grouped at
+  // top of basic block". Clamp back to the block's first legal point, which a
+  // PHI dominates anyway, so the value stays reportable.
+  IP = legalInsertionPt(*IP);
+  if (IP == IP->getParent()->end())
+    return;
 
   // InstrumentationIRBuilder gives the calls a synthetic !dbg location. A
   // plain IRBuilder would leave them without one, which fails the verifier
   // ("inlinable function call ... requires a !dbg location") once a function
   // built with -g is inlined.
   InstrumentationIRBuilder IRB(&*IP);
-  Value *PC = IRB.CreatePtrToInt(&F, Int64Ty);
+
+  // Where there is debug information, replace that synthetic location with the
+  // frame's own. This is what identifies the frame to a consumer: the call
+  // inherits the frame's position in the line table, so the return address the
+  // runtime reads resolves to this frame - to the inlined callee, and not
+  // merely to the function its code was merged into.
+  if (Frame.SP)
+    IRB.SetCurrentDebugLocation(DILocation::get(Frame.SP->getContext(),
+                                                Frame.SP->getScopeLine(), 0,
+                                                Frame.SP, Frame.InlinedAt));
 
   auto trace = [&](unsigned Idx, Value *Val, uint64_t Size,
                    FieldOffsets Offsets) {
     IRB.CreateCall(
         SanCovTraceArgsFunc,
-        {PC, ConstantInt::get(Int32Ty, Idx - 1),
-         ConstantInt::get(Int32Ty, Size),
+        {ConstantInt::get(Int32Ty, Idx - 1), ConstantInt::get(Int32Ty, Size),
          Val ? Val : ConstantInt::get(Int64Ty, 0),
          Offsets.Table ? Offsets.Table : ConstantPointerNull::get(PtrTy),
          ConstantInt::get(Int32Ty, Offsets.NumFields)});
@@ -1697,13 +1860,22 @@ void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
   // are any, describe their fields. ABI lowering is visible to the consumer in
   // this mode: a coerced aggregate is reported as the values it was coerced
   // into, and the indices of the parameters after it shift accordingly.
-  if (Params.empty()) {
+  //
+  // This is the path a build without -g takes. Such a build has no debug
+  // locations, so it has no frame other than the function's own body, and
+  // nothing changes for it here. An inlined frame is discovered from debug
+  // information and so always has records; it also has no IR argument list of
+  // its own to fall back to, the callee's arguments having become ordinary
+  // values of the caller when it was inlined.
+  if (Frame.Params.empty()) {
+    if (Frame.InlinedAt)
+      return;
     unsigned Idx = 1;
     for (Argument &Arg : F.args()) {
       // A struct-return pointer has no source-level counterpart.
       if (Arg.hasStructRetAttr())
         continue;
-      traceValue(Idx, &Arg, getDeclaredParamType(SP, Idx),
+      traceValue(Idx, &Arg, getDeclaredParamType(Frame.SP, Idx),
                  /*WholeObject=*/true);
       ++Idx;
     }
@@ -1714,14 +1886,14 @@ void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
   // parameter the ABI split across registers is reported once per piece: the
   // pieces have no common address to report them from. A parameter with no
   // usable location is still reported, with size 0, so that a consumer sees
-  // every parameter the function declares.
-  unsigned NumParams = getNumDeclaredParams(SP);
-  for (const auto &[Idx, Param] : Params)
+  // every parameter the frame's subprogram declares.
+  unsigned NumParams = getNumDeclaredParams(Frame.SP);
+  for (const auto &[Idx, Param] : Frame.Params)
     NumParams = std::max(NumParams, Idx);
 
   for (unsigned Idx = 1; Idx <= NumParams; ++Idx) {
-    auto It = Params.find(Idx);
-    if (It == Params.end() || It->second.Pieces.empty()) {
+    auto It = Frame.Params.find(Idx);
+    if (It == Frame.Params.end() || It->second.Pieces.empty()) {
       trace(Idx, nullptr, 0, {});
       continue;
     }
@@ -1735,6 +1907,12 @@ void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
 void ModuleSanitizerCoverage::InjectTraceForRet(Function &F) {
   DIType *RetTy = getDeclaredReturnType(F.getSubprogram());
 
+  // Only \p F's own frame is reported here. A callee the inliner merged into
+  // \p F has no return instruction left - its result became an ordinary value
+  // of \p F - and no debug record describes a return value the way
+  // DILocalVariable describes a parameter, so there is nothing to key an
+  // inlined return on. Arguments of inlined frames are still reported; see
+  // collectInlineFrames().
   // A struct returned by value may be lowered to an indirect return: the IR
   // function returns void and writes the result through a hidden struct-return
   // pointer. Report that buffer, so an indirect return is not dropped. This
@@ -1759,12 +1937,11 @@ void ModuleSanitizerCoverage::InjectTraceForRet(Function &F) {
       continue;
 
     InstrumentationIRBuilder IRB(RI);
-    Value *PC = IRB.CreatePtrToInt(&F, Int64Ty);
 
     auto trace = [&](Value *Val, uint64_t Size, FieldOffsets Offsets) {
       IRB.CreateCall(
           SanCovTraceRetFunc,
-          {PC, ConstantInt::get(Int32Ty, Size),
+          {ConstantInt::get(Int32Ty, Size),
            Val ? Val : ConstantInt::get(Int64Ty, 0),
            Offsets.Table ? Offsets.Table : ConstantPointerNull::get(PtrTy),
            ConstantInt::get(Int32Ty, Offsets.NumFields)});

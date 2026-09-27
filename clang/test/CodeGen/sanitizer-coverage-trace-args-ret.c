@@ -25,7 +25,7 @@ int returns_scalar(int x) { return x + 1; }
 // ARGS-LABEL: define {{.*}} @takes_struct_ptr(
 // ARGS-NOT: alloca
 // ARGS: %[[ADDR:.*]] = ptrtoint ptr %f to i64
-// ARGS: call void @__sanitizer_cov_trace_args({{.*}}, i32 0, i32 16, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 2)
+// ARGS: call void @__sanitizer_cov_trace_args(i32 0, i32 16, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 2)
 // ARGS-LABEL: define {{.*}} @returns_scalar(
 // ARGS: call void @__sanitizer_cov_trace_args(
 // ARGS-NOT: call void @__sanitizer_cov_trace_ret(

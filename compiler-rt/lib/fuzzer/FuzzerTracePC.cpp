@@ -521,27 +521,30 @@ void __sanitizer_cov_trace_cmp8(uint64_t Arg1, uint64_t Arg2) {
 }
 
 // Argument and return value tracing (-fsanitize-coverage=trace-args,trace-ret).
-// Unlike the cmp callbacks these receive the PC from the instrumentation - the
-// address of the instrumented function, not of the call site - and fold the
-// observed value into the value profile.
+// The instrumentation does not pass a PC: like the cmp callbacks these take
+// their own return address, less one so that it lies within the call rather
+// than on the instruction after it. That is also what separates a callee the
+// compiler inlined - whose parameters are reported from inside the inlined
+// body - from the function it was inlined into. The observed value is folded
+// into the value profile.
 ATTRIBUTE_INTERFACE
 ATTRIBUTE_NO_SANITIZE_ALL
-void __sanitizer_cov_trace_args(uint64_t PC, uint32_t ArgIdx, uint32_t Size,
-                                uint64_t Val, const uint64_t *Offsets,
-                                uint32_t NumFields) {
-  fuzzer::TPC.HandleDataflow(static_cast<uintptr_t>(PC), ArgIdx, Size, Val,
-                             Offsets, NumFields);
+void __sanitizer_cov_trace_args(uint32_t ArgIdx, uint32_t Size, uint64_t Val,
+                                const uint64_t *Offsets, uint32_t NumFields) {
+  uintptr_t PC = reinterpret_cast<uintptr_t>(GET_CALLER_PC()) - 1;
+  fuzzer::TPC.HandleDataflow(PC, ArgIdx, Size, Val, Offsets, NumFields);
 }
 
 ATTRIBUTE_INTERFACE
 ATTRIBUTE_NO_SANITIZE_ALL
-void __sanitizer_cov_trace_ret(uint64_t PC, uint32_t Size, uint64_t Val,
+void __sanitizer_cov_trace_ret(uint32_t Size, uint64_t Val,
                                const uint64_t *Offsets, uint32_t NumFields) {
-  // Returns share the PC with the arguments of the same function, so they need
-  // a location of their own; no function has this many parameters.
+  uintptr_t PC = reinterpret_cast<uintptr_t>(GET_CALLER_PC()) - 1;
+  // A return has its own call site, so it cannot collide with the arguments of
+  // the same function; the distinct location only keeps the value profile from
+  // mixing a return value into an argument's counters.
   const uint32_t kReturnLoc = 0xFFFF;
-  fuzzer::TPC.HandleDataflow(static_cast<uintptr_t>(PC), kReturnLoc, Size, Val,
-                             Offsets, NumFields);
+  fuzzer::TPC.HandleDataflow(PC, kReturnLoc, Size, Val, Offsets, NumFields);
 }
 
 ATTRIBUTE_INTERFACE

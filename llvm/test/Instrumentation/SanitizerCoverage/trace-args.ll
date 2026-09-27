@@ -28,10 +28,10 @@ entry:
 ; CHECK-LABEL: define void @two_params(
 ; CHECK-NOT: alloca
 ; CHECK: %[[ADDR:[0-9]+]] = ptrtoint ptr %s to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @two_params to i64), i32 0, i32 16, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 2)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 16, i64 %[[ADDR]], ptr @__sancov_offsets_, i32 2)
 ; The scalar is reported as its own value, widened to 64 bits.
 ; CHECK: %[[X:[0-9]+]] = zext i32 %x to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @two_params to i64), i32 1, i32 4, i64 %[[X]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 1, i32 4, i64 %[[X]], ptr null, i32 0)
 
 ; struct S sret_and_scalar(int x), returning the struct through a hidden
 ; struct-return pointer: that pointer is not a source-level parameter, so `x`
@@ -42,8 +42,8 @@ entry:
   ret void
 }
 ; CHECK-LABEL: define void @sret_and_scalar(
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @sret_and_scalar to i64), i32 0, i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
-; CHECK-NOT: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @sret_and_scalar to i64), i32 1
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
+; CHECK-NOT: call void @__sanitizer_cov_trace_args(i32 1
 
 ; void dead_param(struct S *s, int x) with `x` optimized away: it has no debug
 ; record left, but the subprogram still declares it, so it is reported with
@@ -54,8 +54,8 @@ entry:
   ret void
 }
 ; CHECK-LABEL: define void @dead_param(
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @dead_param to i64), i32 0, i32 16, i64 %{{[0-9]+}}, ptr @__sancov_offsets_, i32 2)
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @dead_param to i64), i32 1, i32 0, i64 0, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 16, i64 %{{[0-9]+}}, ptr @__sancov_offsets_, i32 2)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 1, i32 0, i64 0, ptr null, i32 0)
 
 ; A pointer whose pointee has no field layout - void *, int * - is reported as
 ; the pointer value itself rather than as an address to read through.
@@ -66,7 +66,7 @@ entry:
 }
 ; CHECK-LABEL: define void @opaque_pointer(
 ; CHECK: %[[P:[0-9]+]] = ptrtoint ptr %p to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @opaque_pointer to i64), i32 0, i32 8, i64 %[[P]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 8, i64 %[[P]], ptr null, i32 0)
 
 ; A floating-point parameter is reported as its bit pattern.
 define void @floating(double %d) !dbg !34 {
@@ -76,7 +76,7 @@ entry:
 }
 ; CHECK-LABEL: define void @floating(
 ; CHECK: %[[BITS:[0-9]+]] = bitcast double %d to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @floating to i64), i32 0, i32 8, i64 %[[BITS]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 8, i64 %[[BITS]], ptr null, i32 0)
 
 !llvm.dbg.cu = !{!0}
 !llvm.module.flags = !{!1, !2}

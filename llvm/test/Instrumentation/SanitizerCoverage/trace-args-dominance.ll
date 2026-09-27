@@ -25,9 +25,9 @@ bb:
   ret void, !dbg !12
 }
 ; CHECK-LABEL: define void @location_does_not_dominate(
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @location_does_not_dominate to i64), i32 0, i32 0, i64 0, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 0, i64 0, ptr null, i32 0)
 ; CHECK: %[[B:[0-9]+]] = ptrtoint ptr %b to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @location_does_not_dominate to i64), i32 1, i32 8, i64 %[[B]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 1, i32 8, i64 %[[B]], ptr null, i32 0)
 
 ; `a` is dead and described as poison; `b` is live.
 define void @poison_location(ptr %b) !dbg !13 {
@@ -38,9 +38,9 @@ entry:
 }
 ; CHECK-LABEL: define void @poison_location(
 ; CHECK-NOT: ptrtoint ptr poison
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @poison_location to i64), i32 0, i32 0, i64 0, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 0, i64 0, ptr null, i32 0)
 ; CHECK: %[[PB:[0-9]+]] = ptrtoint ptr %b to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @poison_location to i64), i32 1, i32 8, i64 %[[PB]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 1, i32 8, i64 %[[PB]], ptr null, i32 0)
 
 !llvm.dbg.cu = !{!0}
 !llvm.module.flags = !{!1, !2}

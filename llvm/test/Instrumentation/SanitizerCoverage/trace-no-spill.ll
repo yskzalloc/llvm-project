@@ -21,9 +21,9 @@ entry:
 }
 ; CHECK-LABEL: define i32 @clobbers_rbx(
 ; CHECK: %[[A:[0-9]+]] = zext i32 %x to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @clobbers_rbx to i64), i32 0, i32 4, i64 %[[A]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %[[A]], ptr null, i32 0)
 ; CHECK: %[[R:[0-9]+]] = zext i32 %x to i64
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @clobbers_rbx to i64), i32 4, i64 %[[R]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 4, i64 %[[R]], ptr null, i32 0)
 ; CHECK: ret i32 %x
 
 ; A cpuid-style "=b" output operand names the same register.
@@ -33,8 +33,8 @@ entry:
   ret i32 %0, !dbg !11
 }
 ; CHECK-LABEL: define i32 @uses_b_constraint(
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @uses_b_constraint to i64), i32 0, i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @uses_b_constraint to i64), i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 4, i64 %{{[0-9]+}}, ptr null, i32 0)
 
 ; The same function without such inline assembly, instrumented identically.
 define i32 @plain(i32 %x) #0 !dbg !12 {
@@ -43,9 +43,9 @@ entry:
 }
 ; CHECK-LABEL: define i32 @plain(
 ; CHECK: %[[PA:[0-9]+]] = zext i32 %x to i64
-; CHECK: call void @__sanitizer_cov_trace_args(i64 ptrtoint (ptr @plain to i64), i32 0, i32 4, i64 %[[PA]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %[[PA]], ptr null, i32 0)
 ; CHECK: %[[PR:[0-9]+]] = zext i32 %x to i64
-; CHECK: call void @__sanitizer_cov_trace_ret(i64 ptrtoint (ptr @plain to i64), i32 4, i64 %[[PR]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i32 4, i64 %[[PR]], ptr null, i32 0)
 
 attributes #0 = { nounwind sanitize_address }
 
