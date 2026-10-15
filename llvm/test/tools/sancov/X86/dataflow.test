@@ -1,0 +1,143 @@
+## Check that sancov locates and symbolizes the call sites of the
+## -fsanitize-coverage=trace-args,trace-ret callbacks. A call site keeps the
+## location the pass gave it: one that was inlined after instrumentation, as
+## LTO may do, resolves to the function it was instrumented in, inlined into
+## its caller.
+
+REQUIRES: x86-registered-target
+RUN: split-file %s %t
+RUN: llc -O0 -filetype=obj %t/dataflow.ll -o %t/dataflow.o
+RUN: llvm-objdump -d --no-show-raw-insn %t/dataflow.o > %t/disas.txt
+
+DISAS: <add>:
+DISAS: [[#%x,ARGS0:]]: callq {{.*}} <__sanitizer_cov_trace_args>
+DISAS: [[#%x,ARGS1:]]: callq {{.*}} <__sanitizer_cov_trace_args>
+DISAS: [[#%x,INLINED:]]: callq {{.*}} <__sanitizer_cov_trace_args>
+DISAS: [[#%x,RET:]]: callq {{.*}} <__sanitizer_cov_trace_ret>
+
+## A call site is the return address of the call minus one; a callq here is
+## 5 bytes long.
+RUN: cp %t/disas.txt %t/pcs.txt
+RUN: sancov -print-dataflow-pcs %t/dataflow.o >> %t/pcs.txt
+RUN: FileCheck %s --check-prefixes=DISAS,PCS < %t/pcs.txt
+PCS:      0x[[#%x,ARGS0+4]] args
+PCS-NEXT: 0x[[#%x,ARGS1+4]] args
+PCS-NEXT: 0x[[#%x,INLINED+4]] args
+PCS-NEXT: 0x[[#%x,RET+4]] ret
+PCS-NOT:  {{.}}
+
+## Coverage points are unaffected: there are none in this object.
+RUN: not sancov -print-coverage-pcs %t/dataflow.o 2>&1 | FileCheck %s --check-prefix=NOCOV
+NOCOV: ERROR: __sanitizer_cov* functions not found
+
+RUN: cp %t/disas.txt %t/json.txt
+RUN: sancov -symbolize-dataflow -strip_path_prefix=/tmp/ %t/dataflow.o >> %t/json.txt
+RUN: FileCheck %s --check-prefixes=DISAS,JSON < %t/json.txt
+JSON:      "pc": "0x[[#%x,ARGS0+4]]",
+JSON-NEXT: "kind": "args",
+JSON-NEXT: "frames": [
+JSON-NEXT:   {
+JSON-NEXT:     "function": "add",
+JSON-NEXT:     "file": "dataflow.c",
+JSON-NEXT:     "line": 3,
+JSON-NEXT:     "column": 0
+JSON-NEXT:   }
+JSON-NEXT: ]
+JSON:      "pc": "0x[[#%x,ARGS1+4]]",
+JSON-NEXT: "kind": "args",
+JSON:      "pc": "0x[[#%x,INLINED+4]]",
+JSON-NEXT: "kind": "args",
+JSON-NEXT: "frames": [
+JSON-NEXT:   {
+JSON-NEXT:     "function": "helper",
+JSON-NEXT:     "file": "dataflow.c",
+JSON-NEXT:     "line": 1,
+JSON-NEXT:     "column": 0
+JSON-NEXT:   },
+JSON-NEXT:   {
+JSON-NEXT:     "function": "add",
+JSON-NEXT:     "file": "dataflow.c",
+JSON-NEXT:     "line": 4,
+JSON-NEXT:     "column": 10
+JSON-NEXT:   }
+JSON-NEXT: ]
+JSON:      "pc": "0x[[#%x,RET+4]]",
+JSON-NEXT: "kind": "ret",
+JSON-NEXT: "frames": [
+JSON-NEXT:   {
+JSON-NEXT:     "function": "add",
+JSON-NEXT:     "file": "dataflow.c",
+JSON-NEXT:     "line": 5,
+JSON-NEXT:     "column": 3
+JSON-NEXT:   }
+JSON-NEXT: ]
+
+## The ignorelist applies to the innermost frame.
+RUN: echo "fun:helper" > %t/ignorelist.txt
+RUN: sancov -symbolize-dataflow -ignorelist=%t/ignorelist.txt %t/dataflow.o | FileCheck %s --check-prefix=IGNORE
+IGNORE-COUNT-3: "pc":
+IGNORE-NOT: "function": "helper"
+
+RUN: llc -O0 -filetype=obj %t/nodataflow.ll -o %t/nodataflow.o
+RUN: not sancov -print-dataflow-pcs %t/nodataflow.o 2>&1 | FileCheck %s --check-prefix=MISSING
+MISSING: ERROR: __sanitizer_cov_trace_args and __sanitizer_cov_trace_ret functions not found
+
+;--- dataflow.ll
+;; Already instrumented, as if from:
+;;   1  int helper(int x) {
+;;   2    return x + 1; }
+;;   3  int add(int a, int b) {
+;;   4    int c = helper(a);
+;;   5    return c + b; }
+;; with helper instrumented and then inlined into add.
+;; The callbacks are local so that the calls to them resolve without
+;; relocations in the object file.
+target triple = "x86_64-unknown-linux-gnu"
+
+define internal void @__sanitizer_cov_trace_args(i32 %idx, i32 %size, i64 %val, ptr %offsets, i32 %num) noinline {
+  ret void
+}
+
+define internal void @__sanitizer_cov_trace_ret(i32 %size, i64 %val, ptr %offsets, i32 %num) noinline {
+  ret void
+}
+
+define i32 @add(i32 %a, i32 %b) !dbg !10 {
+  %za = zext i32 %a to i64
+  %zb = zext i32 %b to i64
+  call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %za, ptr null, i32 0), !dbg !13
+  call void @__sanitizer_cov_trace_args(i32 1, i32 4, i64 %zb, ptr null, i32 0), !dbg !13
+  ;; helper's own trace-args call, inlined with helper at line 4.
+  call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %za, ptr null, i32 0), !dbg !16
+  %h = add i32 %a, 1, !dbg !16
+  %c = add i32 %h, %b, !dbg !18
+  %zc = zext i32 %c to i64
+  call void @__sanitizer_cov_trace_ret(i32 4, i64 %zc, ptr null, i32 0), !dbg !18
+  ret i32 %c, !dbg !18
+}
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, producer: "clang", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)
+!1 = !DIFile(filename: "dataflow.c", directory: "/tmp")
+!2 = !{i32 7, !"Dwarf Version", i32 5}
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = !DISubroutineType(types: !5)
+!5 = !{!6, !6, !6}
+!6 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!7 = !DISubroutineType(types: !8)
+!8 = !{!6, !6}
+!10 = distinct !DISubprogram(name: "add", scope: !1, file: !1, line: 3, type: !4, scopeLine: 3, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!11 = distinct !DISubprogram(name: "helper", scope: !1, file: !1, line: 1, type: !7, scopeLine: 1, spFlags: DISPFlagLocalToUnit | DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!13 = !DILocation(line: 3, column: 0, scope: !10)
+!15 = distinct !DILocation(line: 4, column: 10, scope: !10)
+!16 = !DILocation(line: 1, column: 0, scope: !11, inlinedAt: !15)
+!18 = !DILocation(line: 5, column: 3, scope: !10)
+
+;--- nodataflow.ll
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @f(i32 %a) {
+  ret i32 %a
+}

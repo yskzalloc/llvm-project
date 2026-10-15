@@ -28,6 +28,10 @@ def union_files : F<"union", "Compute union of multiple sancov files and write t
   Group<action_grp>;
 def printCoveragePcs : F<"print-coverage-pcs", "Print coverage instrumentation points addresses.">,
   Group<action_grp>;
+def printDataflowPcs : F<"print-dataflow-pcs", "Print trace-args/trace-ret instrumentation points addresses.">,
+  Group<action_grp>;
+def symbolizeDataflow : F<"symbolize-dataflow", "Produces a symbolized JSON report of trace-args/trace-ret instrumentation points.">,
+  Group<action_grp>;
 def coveredFunctions : F<"covered-functions", "Print all covered funcions.">,
   Group<action_grp>;
 def notCoveredFunctions : F<"not-covered-functions", "Print all not covered funcions.">,

@@ -1,0 +1,33 @@
+## A trace-args/trace-ret call site is the return address of the call minus one
+## on every target, which is what the callbacks' consumers record; it is not
+## stepped back by an instruction the way coverage points are. On AArch64 that
+## puts it 3 bytes into the 4-byte bl.
+
+REQUIRES: aarch64-registered-target
+RUN: split-file %s %t
+RUN: llc -O0 -mtriple=aarch64-linux-gnu -filetype=obj %t/dataflow.ll -o %t/dataflow.o
+RUN: llvm-objdump -d --no-show-raw-insn %t/dataflow.o > %t/out.txt
+RUN: sancov -print-dataflow-pcs %t/dataflow.o >> %t/out.txt
+RUN: FileCheck %s < %t/out.txt
+
+CHECK: <f>:
+CHECK: [[#%x,ARGS:]]: bl {{.*}} <__sanitizer_cov_trace_args>
+CHECK: [[#%x,RET:]]: bl {{.*}} <__sanitizer_cov_trace_ret>
+CHECK:      0x[[#%x,ARGS+3]] args
+CHECK-NEXT: 0x[[#%x,RET+3]] ret
+CHECK-NOT:  {{.}}
+
+;--- dataflow.ll
+define internal void @__sanitizer_cov_trace_args(i32 %idx, i32 %size, i64 %val, ptr %offsets, i32 %num) noinline {
+  ret void
+}
+
+define internal void @__sanitizer_cov_trace_ret(i32 %size, i64 %val, ptr %offsets, i32 %num) noinline {
+  ret void
+}
+
+define i64 @f(i64 %a) {
+  call void @__sanitizer_cov_trace_args(i32 0, i32 8, i64 %a, ptr null, i32 0)
+  call void @__sanitizer_cov_trace_ret(i32 8, i64 %a, ptr null, i32 0)
+  ret i64 %a
+}
