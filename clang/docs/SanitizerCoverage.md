@@ -330,6 +330,392 @@ void __sanitizer_cov_store8(uint64_t *addr);
 void __sanitizer_cov_store16(__int128 *addr);
 ```
 
+## Tracing function arguments and return values
+
+With `-fsanitize-coverage=trace-args` the compiler will insert a callback for
+each argument of every instrumented function, on entry, and with
+`-fsanitize-coverage=trace-ret` a callback before every return. Neither flag
+needs another coverage mode: used alone, they emit no block or edge callbacks.
+
+The design rule for both flags is:
+
+> Debug information may enrich the interpretation of an observation, but must
+> never determine which instrumentation is emitted.
+
+What is observed is decided by the LLVM IR of the instrumented function alone.
+A build with `-g` emits exactly the same callbacks, with the same operands, and
+the same machine code, as a build without it; debug information gives the
+calls a source location and nothing else.
+
+```c++
+// Called once per observed IR argument, or element of one, on entry.
+// arg_idx:    zero-based position of the argument in the IR parameter list
+// size:       number of bytes reported, 0 if there was nothing to report
+// val:        the value itself, or the address of the bytes to read
+// offsets:    table of `num_fields` [byte offset, byte size] pairs, none
+//             wider than 8 bytes, of what to read at `val`, or null
+// num_fields: number of pairs in `offsets`, 0 if `val` is a value
+void __sanitizer_cov_trace_args(uint32_t arg_idx, uint32_t size, uint64_t val,
+                                uint64_t *offsets, uint32_t num_fields);
+
+// Called before each return; once per element of a first-class aggregate
+// return value.
+void __sanitizer_cov_trace_ret(uint32_t size, uint64_t val, uint64_t *offsets,
+                               uint32_t num_fields);
+```
+
+Neither callback is told which function it speaks for. A runtime that needs to
+know takes its own return address, less one so that the address lies within the
+call rather than on the instruction after it, and resolves it like any other
+code address. This is the same convention as the `trace-cmp` callbacks. Every
+observation has a call of its own, which is never a tail call, so that address
+identifies it.
+
+`num_fields` says what `val` holds:
+
+* `num_fields == 0`: `val` **is** the value, its low `size` bytes,
+  zero-extended. Integers, pointers, floating-point values and vectors are
+  reported this way: a pointer as the address it holds, a floating-point value
+  or a vector as its bit pattern, and a value wider than 64 bits by its low 64
+  bits.
+
+* `num_fields != 0`: `val` is the **address** of `size` bytes that may be read
+  at the call, and `offsets` says which: `num_fields` pieces, none wider than
+  8 bytes, so a consumer reading each into a 64-bit word reads all of them.
+  That is one of
+
+  * an object the ABI placed in memory, which the IR itself marks as one: an
+    argument with a `byval`, `byref`, `inalloca` or `preallocated` attribute,
+    or the `sret` buffer of an indirect return. `offsets` describes the
+    elements of its IR type, nested structs included; anything wider than
+    8 bytes - an array, or the opaque `[N x i8]` rustc types every such object
+    as - in 8-byte pieces.
+  * a *pointee snapshot*: a pointer argument the IR says is
+    `dereferenceable(N)` or `dereferenceable_or_null(N)` on entry, or a
+    pointer return value the function's return attributes say is, at the
+    return. `val` is the pointer, and `size` is the first
+    min(N, `-sanitizer-coverage-trace-pointee-bytes`) bytes it points to
+    (64 by default; 0 reports every pointer by value), covered in 8-byte
+    pieces. The IR attribute alone bounds the read - the IR has no pointee
+    type - so the bytes are raw; a consumer cuts them into members with the
+    binary's debug information (see "Source-level interpretation"). A
+    `dereferenceable_or_null` pointer may be null, which the runtime checks.
+
+  The observation descriptor says which of the two it is. Every other
+  pointer is reported by value, and what it points to is never read: the
+  instrumentation reads memory only as far as the IR proves it may.
+
+`size == 0` means there was nothing to report: a `void` return, a value with no
+fixed-size bit pattern, such as a scalable vector, or an object the function
+does not use. Callers may pass anything for an argument the function does not
+use - dead argument elimination passes poison in the callers it can see - so
+such an object is not handed to the runtime to read; an unused value is still
+reported. A value that may be poison is frozen first, so `val` always holds
+bits.
+
+The compiler never creates memory to report a value from, so no stack slot
+escapes and no frame is realigned on the instrumentation's account.
+
+### IR arguments, not source parameters
+
+`arg_idx` is the position of the argument in the IR function's parameter list.
+That is the ABI's view of the signature, and it is not guaranteed to equal the
+source-language parameter number:
+
+* One source parameter may be several IR arguments. On x86-64,
+  `void f(struct mix { double d; long l; } m, int z)` is
+  `f(double %0, i64 %1, i32 %2)`: `m` is IR arguments 0 and 1, and `z` is IR
+  argument 2.
+* One IR argument may be several observations. On AArch64 the same function is
+  `f([2 x i64] %0, i32 %1)`: the first-class aggregate `%0` is reported as two
+  callbacks, both with `arg_idx == 0`, and `z` is IR argument 1.
+* A hidden struct-return (`sret`) pointer and a Swift error slot are not
+  observed, but keep their positions: in `struct big f(long x)`, lowered to
+  `f(ptr sret %0, i64 %1)`, `x` is reported with `arg_idx == 1`.
+* A C++ `this` is an ordinary pointer argument, reported as its value - with
+  the `sizeof` bytes of the object it points to, which the IR says are
+  dereferenceable, as for a C++ reference.
+
+A struct the ABI passes by address without an IR attribute that says so - a
+large struct on AArch64, a non-trivially-copyable C++ object - is a pointer
+argument, and is reported as the pointer, with what it points to if the IR
+says it is dereferenceable.
+
+Which pointers the IR says that of depends on the front end. Clang gives C++
+references and `this` `dereferenceable(sizeof(T))`, as it does a struct the ABI
+passes by address (on AArch64, any over 16 bytes), and a C array parameter of
+static size, `const struct s p[static 1]`, `dereferenceable` that far; a plain
+C pointer has no such attribute, and is reported by value. rustc gives `&T` and
+`&mut T` arguments `dereferenceable(size_of::<T>())`, `Option<&T>`
+`dereferenceable_or_null`, and the vtable of a `&dyn Trait` its size; not a
+`Box<T>`, a raw pointer, the data of a slice or trait object, a `&` to a
+`!Freeze` type (`Cell`, `UnsafeCell`) or a `&mut` to a `!Unpin` one, nor any
+return value.
+
+### Pointers: values, layouts and snapshots
+
+Four things about a pointer argument or return value are easily confused, and
+only the first and the third are recorded:
+
+* The **pointer value**, the address it holds: always reported, as `val`.
+* The **source-level pointee type and member layout**: what the debug
+  information says it points to. A consumer such as `sancov` names and lays
+  out the members from it, but debug information never causes anything to be
+  read; a pointee the runtime read nothing of is reported with its layout and
+  no values (`"observed": false`, `bytes_read` 0).
+* An explicit **pointee snapshot**: bytes the runtime reads behind the pointer
+  at the trace point. Only an explicit IR dereferenceability contract causes
+  the instrumentation runtime to read behind a pointer:
+  `dereferenceable(N)`, or `dereferenceable_or_null(N)` with a null check, and
+  then the first min(N, `-sanitizer-coverage-trace-pointee-bytes`) bytes. The
+  attribute gives a bounded readable range, not a type: which members those
+  bytes are is the decoder's business, with the debug information.
+* **Complete and partial values**: a member wholly within the bytes read is a
+  complete value; one the byte limit cuts is reported as partial
+  (`"complete": false`), and one beyond it was not read (`"observed": false`).
+
+What carries the contract is up to the front end (see above). An ordinary C
+`T *` argument normally does not, and is a pointer value only; a Rust `&T` or
+`&mut T` usually does; a Rust raw pointer, `*const T` or `*mut T`, does not,
+nor does a C pointer unless declared `T p[static N]`. Nothing is inferred to
+stand in for a missing contract - not from later accesses, the size of an
+object, the callers, the debug information or what must execute - and a
+pointer stored inside a snapshot is a value too: what it points to is not
+read. The instrumentation therefore does not reconstruct every pointer
+argument, nor complete structs behind pointers. As a measure of how far it
+goes, on an x86-64 Linux kernel build the pointee of 0 of 23,810 C pointer
+arguments has a byte recorded, and on arm64 21 of 22,606 (structs AArch64
+passes by reference); of the 756 pointer arguments of the kernel's Rust
+objects, 318 (42%) do. These are the shares of pointer arguments with at
+least one recorded pointee byte, not of arguments, structs or return values
+reconstructed in full.
+
+Recording, for a pointer without a contract, the values the function itself
+loads and stores through it, when it does, is possible future work, and not
+part of this implementation.
+
+Mapping an observation to a source parameter, or to a struct field, is the
+job of a consumer that has the binary's debug information - see "Source-level
+interpretation" below; the instrumentation does not attempt it. An inlined callee is not an IR function
+of its own any more, so its parameters are not observed: arguments are those of
+the IR functions that remain after the inliner ran. `-fno-inline` makes more of
+them visible, at the usual cost.
+
+Argument values are read on entry, before the `-O0` prologue stores the
+incoming arguments to their stack slots, so they are correct at any
+optimization level; return values likewise.
+
+### Observation descriptors
+
+On ELF x86 and AArch64 targets the compiler also emits, for every trace call,
+an *observation descriptor* into the `__sancov_dataflow` section, so that an
+offline consumer can tell what each call site observes without disassembling
+the code around it or reimplementing the target ABI. The descriptor is built
+from the IR alone and is identical with and without `-g`. Each entry is the
+PC-relative offset of the call instruction (32 bits; 64 for the medium and large
+code models), followed by, in the target's byte order:
+
+| Field | Type | Meaning |
+|---|---|---|
+| version | `u8` | 1 |
+| flags | `u8` | 1 return, 2 element of a first-class aggregate, 4 in-memory argument (`byval`, `byref`, `inalloca`, `preallocated`), 8 `sret` object, 16 the function has an `sret` or Swift error argument, 32 the function does not use the argument, 64 a pointer reported with a snapshot of the bytes it points to |
+| class | `u8` | 0 none, 1 integer, 2 pointer, 3 floating point, 4 vector, 5 object in memory |
+| reserved | `u8` | 0 |
+| IR argument | `u16` | `arg_idx`; `0xffff` for a return |
+| IR arguments | `u16` | number of IR arguments of the function |
+| element | `u16` | element of a first-class aggregate, else 0 |
+| reserved | `u16` | 0 |
+| size | `u32` | the callback's `size`: for a pointee snapshot, the bytes read |
+| element offset | `u32` | byte offset of the element in the aggregate's IR layout |
+
+Every entry has the same size whatever its version, which is 1 to 127, so a
+decoder skips an entry of a version it does not know and decodes the others.
+
+Both the IR argument and the element are needed: AArch64 passes
+`struct mix { double d; long l; }` as `[2 x i64] %0`, observations (0, 0) and
+(0, 1), while x86-64 passes it as `double %0, i64 %1`, observations (0, 0) and
+(1, 0).
+
+The section is allocated, so stripping debug information keeps it, and is
+linked (`SHF_LINK_ORDER`) to the section of the function it describes, so it
+follows that function through COMDAT deduplication, `--gc-sections` and
+identical code folding. Its PC entries are relative relocations resolved at
+link time, valid in relocatable objects, executables, PIE and shared objects
+alike. No code refers to it. An argument the function does not use is flagged.
+
+### Source-level interpretation
+
+Debug information may enrich the interpretation of an observation; it never
+changes the instrumentation. With `-g`, the compiler records which source
+parameter, and which bits of it, each argument observation holds, as the IR's
+debug records state it at the point the pass runs: a debug-only *source map*
+of `DW_TAG_LLVM_sancov_observation` children of each function's
+`DW_TAG_subprogram`, each with
+
+* `DW_AT_LLVM_sancov_ir_arg` and `DW_AT_LLVM_sancov_element`: the observation;
+* `DW_AT_LLVM_sancov_variable`: a reference to the parameter's
+  `DW_TAG_formal_parameter`, and `DW_AT_LLVM_sancov_source_arg` its
+  source-language parameter number - or, for a hidden argument the front end
+  describes with an artificial variable (a Fortran `CHARACTER` length, Swift
+  type metadata), to that `DW_TAG_variable`, without a number;
+* `DW_AT_data_bit_offset` and `DW_AT_bit_size`: which bits of the parameter the
+  observed value holds, from bit `DW_AT_LLVM_sancov_value_bit_offset` (0 when
+  absent) of the value on;
+* or `DW_AT_LLVM_sancov_indirect`: the observed value is the address of the
+  parameter, as for a `byval` struct or a C++ object passed by address.
+
+The map holds only that association. Types, members, offsets, sizes and
+bitfields come from the ordinary DWARF of the parameter, and a return value's
+type from the subprogram's `DW_AT_type`. Without debug information there is no
+map; with it, the code and the descriptors stay byte-identical. It travels with
+the rest of the DWARF: split DWARF puts it in the `.dwo`, and stripping or
+separating debug information removes or moves it like any other DIE.
+
+`sancov -symbolize-dataflow` reports, for every call site, the observation from
+its descriptor and the source it resolves to, with how it was resolved:
+
+```console
+% sancov -symbolize-dataflow a.out
+      "observation": { "ir_arg": 2, "ir_args": 3, "class": "integer",
+                       "size": 4, "flags": [] },
+      "source": {
+        "provenance": "exact", "method": "compiler source map",
+        "summary": "IR argument 2 -> source parameter \"z\" [exact: compiler source map]",
+        "parameter": { "name": "z", "number": 2 }, "type": "int",
+        "pieces": [ { "value_bit_offset": 0, "parameter_bit_offset": 0,
+                      "bit_size": 32 } ],
+        "fields": [ { "name": "z", "type": "int", "bit_offset": 0,
+                      "bit_size": 32, "value_bit_offset": 0 } ] }
+```
+
+`fields` lists the members the observation holds and, for a value, where in
+`val` their bits are, so that a consumer can decode them; for an object it
+lists the members by their offsets in it; for a pointer or reference,
+`pointee` lists the members of what it points to, with `bytes_read` the size
+of the snapshot the runtime read behind it (0 if none). The snapshot starts at
+the pointee, so a member's `bit_offset` is where its bits are in the bytes
+read. A member only partly within them is `"complete": false`, and one beyond
+them, or of a pointee that was not read, `"observed": false`:
+
+```console
+      "observation": { "ir_arg": 0, "ir_args": 1, "class": "pointer",
+                       "size": 16, "flags": [ "pointee" ] },
+      "source": { ...
+        "type": "const Point &",
+        "pointee": { "type": "const Point", "bytes_read": 16,
+          "fields": [ { "name": "x", "type": "long", "bit_offset": 0,
+                        "bit_size": 64 },
+                      { "name": "y", "type": "long", "bit_offset": 64,
+                        "bit_size": 64 } ] } }
+```
+
+A pointer that is one piece of a parameter, such as the vtable of a Rust trait
+object, gets the pointee of the member it is. A type DWARF gives no members for
+- Swift describes its types' layout in runtime metadata instead - is one opaque
+field of its size.
+
+The provenance is one of:
+
+* `exact`: from the compiler's source map, or, for a return, the subprogram's
+  return type. Which bytes of a returned first-class aggregate an element holds
+  follows the aggregate's IR layout, labelled `fields_provenance: "heuristic:
+  IR element offset"`.
+* `heuristic`: no source map, and the descriptor shows as many IR arguments as
+  source parameters and no hidden argument, so IR argument *n* is guessed to be
+  source parameter *n + 1*. Which bits of it are held is unknown.
+* `unresolved`: anything else, with the reason - no debug information, no
+  descriptor, a split aggregate or hidden argument making positional mapping
+  ambiguous. The IR-level observation is still reported.
+
+DWARF alone cannot give the exact association, which is why the compiler
+records it. Measured on the C and C++ argument shapes of the trace-args tests
+(`llvm/test/Instrumentation/SanitizerCoverage/Inputs`), call-site DWARF (`DW_TAG_call_site_parameter` with
+location lists) identified 21 of 36 x86-64 and 22 of 37 AArch64 argument
+observations, and fails for
+
+* floating-point arguments, whose FP-to-GPR moves have no call value;
+* stack-passed arguments, whose loads have no call value;
+* small structs coerced into a register, which have no location at the call;
+* split aggregate pieces;
+* every argument of a function returning indirectly (`sret`), which has no
+  location at the call;
+* inlined callees' parameters, which can only be associated heuristically.
+
+Positional mapping identified 32 of 36 and 37 of 37, failing on x86-64 for
+split structs and every parameter after them. The source map identifies all of
+them. `sancov` does not implement the call-site fallback; it needs a
+`DW_TAG_call_site` per trace call, which DWARF only has for callees with debug
+information.
+
+A trace call that is inlined after instrumentation, as LTO may do, reports for
+the function it was instrumented in; `sancov` does not apply that function's
+source map to it and falls back as above. A trace call that the machine
+outliner moved into a shared outlined function loses its identity, as any call
+site does.
+
+### Consumers
+
+`compiler-rt` defines both callbacks weakly and empty in `sanitizer_common`, so
+a program compiled with `trace-args`/`trace-ret` links without a runtime that
+consumes the values; a strong definition overrides the default.
+
+libFuzzer provides one and folds every reported value into the value-profile
+map, enabled with `-use_value_profile=1`. A value bound to its site - the `pc`,
+the argument or return position, and the element within an object - that has
+never been seen there before becomes a new value-profile feature, so an input
+that reaches a function with a new argument value counts as new coverage and is
+kept in the corpus.
+
+The Linux kernel consumes the same callbacks through the KCOV dataflow
+subsystem rather than through compiler-rt.
+
+The `sancov` tool locates the call sites of both callbacks in a binary:
+`-print-dataflow-pcs` prints each of them with its kind, and
+`-symbolize-dataflow` produces a JSON report resolving each one to its source
+location, innermost frame first, its observation descriptor and its source
+interpretation (see above). A call site is the return address of the call minus
+one on every target, the address the libFuzzer and kernel consumers record, so
+a recorded address can be looked up in the report as it is. Call sites are
+found through the observation descriptors, or, without them, as calls to
+callbacks the binary defines; without debug information the frames carry only
+the function name. In a relocatable object, a Linux kernel module for one,
+every section starts at address 0, so each call site also names its `section`
+and is resolved within it; an address a kernel recorded in a module is looked
+up relative to the module's `.text`.
+
+```console
+% sancov -symbolize-dataflow a.out
+{
+  "a.out": [
+    {
+      "pc": "0x1836",
+      "kind": "args",
+      "frames": [
+        { "function": "add", "file": "t.c", "line": 9, "column": 0 }
+      ]
+    },
+    ...
+  ]
+}
+```
+
+### Supported scope
+
+The two flags are validated for:
+
+* C and C++ compiled by Clang, and Rust compiled by a `rustc` whose LLVM
+  carries the pass.
+* ELF targets on x86-64 and AArch64, both in userspace (libFuzzer, a custom
+  runtime) and in the Linux kernel.
+* Code built with or without `-g`, at any optimization level.
+
+Any other frontend or target gets valid instrumentation: the pass works on
+LLVM IR and target-independent IR attributes only, and never emits IR the
+verifier rejects - a Swift `swifterror` slot, for one, is not reported.
+`sancov -print-dataflow-pcs` and `-symbolize-dataflow` work on any target
+whose disassembler can resolve call targets, but are tested on x86-64 and
+AArch64 only.
+
 ## Tracing control flow
 
 With `-fsanitize-coverage=control-flow` the compiler will create a table to collect
@@ -566,8 +952,10 @@ Action (required):
   -not-covered-functions Print all not covered funcions.
   -print-coverage-pcs    Print coverage instrumentation points addresses.
   -print-coverage-stats  Print coverage statistics.
+  -print-dataflow-pcs    Print trace-args/trace-ret instrumentation points addresses.
   -print                 Print coverage addresses
   -symbolize             Produces a symbolized JSON report from binary report.
+  -symbolize-dataflow    Produces a symbolized JSON report of trace-args/trace-ret instrumentation points.
   -union                 Compute union of multiple sancov files and write to the new output sancov file
 
 Generic Options:
