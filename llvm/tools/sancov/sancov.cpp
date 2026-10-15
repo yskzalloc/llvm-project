@@ -87,8 +87,10 @@ enum ActionType {
   NotCoveredFunctionsAction,
   PrintAction,
   PrintCovPointsAction,
+  PrintDataflowPointsAction,
   StatsAction,
   SymbolizeAction,
+  SymbolizeDataflowAction,
   UnionAction
 };
 
@@ -625,9 +627,43 @@ static bool isCoveragePointSymbol(StringRef Name) {
          Name == "__AArch64ADRPThunk___sanitizer_cov_trace_pc_guard";
 }
 
-// Locate __sanitizer_cov* function addresses inside the stubs table on MachO.
-static void findMachOIndirectCovFunctions(const object::MachOObjectFile &O,
-                                          std::set<uint64_t> *Result) {
+// The two callbacks of -fsanitize-coverage=trace-args,trace-ret. Their call
+// sites are not coverage points: one function has a trace-args call per
+// parameter and a trace-ret call per return, so they are reported apart.
+enum class DataflowKind { Args, Ret };
+
+static StringRef getDataflowKindName(DataflowKind Kind) {
+  return Kind == DataflowKind::Args ? "args" : "ret";
+}
+
+static std::optional<DataflowKind> getDataflowCallbackKind(StringRef Name) {
+  // Large Aarch64 binaries use thunks.
+  Name.consume_front("__AArch64ADRPThunk_");
+  // Mac has '___' prefix.
+  if (Name.starts_with("___"))
+    Name = Name.drop_front();
+  if (Name == "__sanitizer_cov_trace_args")
+    return DataflowKind::Args;
+  if (Name == "__sanitizer_cov_trace_ret")
+    return DataflowKind::Ret;
+  return std::nullopt;
+}
+
+static bool isDataflowArgsSymbol(StringRef Name) {
+  return getDataflowCallbackKind(Name) == DataflowKind::Args;
+}
+
+static bool isDataflowRetSymbol(StringRef Name) {
+  return getDataflowCallbackKind(Name) == DataflowKind::Ret;
+}
+
+using CallbackPredicate = function_ref<bool(StringRef)>;
+
+// Locate the addresses of the callbacks IsCallback accepts inside the stubs
+// table on MachO.
+static void findMachOIndirectCallbacks(const object::MachOObjectFile &O,
+                                       CallbackPredicate IsCallback,
+                                       std::set<uint64_t> *Result) {
   MachO::dysymtab_command Dysymtab = O.getDysymtabLoadCommand();
   MachO::symtab_command Symtab = O.getSymtabLoadCommand();
 
@@ -650,7 +686,7 @@ static void findMachOIndirectCovFunctions(const object::MachOObjectFile &O,
               object::SymbolRef Symbol = *(O.getSymbolByIndex(IndirectSymbol));
               Expected<StringRef> Name = Symbol.getName();
               failIfError(Name);
-              if (isCoveragePointSymbol(Name.get())) {
+              if (IsCallback(Name.get())) {
                 Result->insert(Addr);
               }
             }
@@ -664,10 +700,9 @@ static void findMachOIndirectCovFunctions(const object::MachOObjectFile &O,
   }
 }
 
-// Locate __sanitizer_cov* function addresses that are used for coverage
-// reporting.
-static std::set<uint64_t>
-findSanitizerCovFunctions(const object::ObjectFile &O) {
+// Locate the addresses of the callbacks IsCallback accepts.
+static std::set<uint64_t> findCallbackAddrs(const object::ObjectFile &O,
+                                            CallbackPredicate IsCallback) {
   std::set<uint64_t> Result;
 
   for (const object::SymbolRef &Symbol : O.symbols()) {
@@ -690,7 +725,7 @@ findSanitizerCovFunctions(const object::ObjectFile &O) {
             ? Name.drop_front(1)
             : Name;
     if (!(Flags & object::BasicSymbolRef::SF_Undefined) &&
-        isCoveragePointSymbol(EffectiveName)) {
+        IsCallback(EffectiveName)) {
       Result.insert(Address);
     }
   }
@@ -704,16 +739,23 @@ findSanitizerCovFunctions(const object::ObjectFile &O) {
       StringRef Name;
       failIfError(Export.getSymbolName(Name));
 
-      if (isCoveragePointSymbol(Name))
+      if (IsCallback(Name))
         Result.insert(CO->getImageBase() + RVA);
     }
   }
 
   if (const auto *MO = dyn_cast<object::MachOObjectFile>(&O)) {
-    findMachOIndirectCovFunctions(*MO, &Result);
+    findMachOIndirectCallbacks(*MO, IsCallback, &Result);
   }
 
   return Result;
+}
+
+// Locate __sanitizer_cov* function addresses that are used for coverage
+// reporting.
+static std::set<uint64_t>
+findSanitizerCovFunctions(const object::ObjectFile &O) {
+  return findCallbackAddrs(O, isCoveragePointSymbol);
 }
 
 // Ported from
@@ -731,11 +773,12 @@ static uint64_t getPreviousInstructionPc(uint64_t PC, Triple TheTriple) {
   return PC - 4;
 }
 
-// Locate addresses of all coverage points in a file. Coverage point
-// is defined as the 'address of instruction following __sanitizer_cov
-// call - 1'.
-static void getObjectCoveragePoints(const object::ObjectFile &O,
-                                    std::set<uint64_t> *Addrs) {
+// Call Fn(NextAddr, Target) for every direct call in the text sections of O
+// whose target can be evaluated, NextAddr being the address of the instruction
+// that follows the call. Each kind of point steps back from it in its own way.
+static void
+visitCallSites(const object::ObjectFile &O,
+               function_ref<void(uint64_t NextAddr, uint64_t Target)> Fn) {
   Triple TheTriple("unknown-unknown-unknown");
   TheTriple.setArch(Triple::ArchType(O.getArch()));
   auto TripleName = TheTriple.getTriple();
@@ -769,10 +812,6 @@ static void getObjectCoveragePoints(const object::ObjectFile &O,
       TheTarget->createMCInstrAnalysis(MII.get()));
   failIfEmpty(MIA, "no instruction analysis info for target " + TripleName);
 
-  auto SanCovAddrs = findSanitizerCovFunctions(O);
-  if (SanCovAddrs.empty())
-    fail("__sanitizer_cov* functions not found");
-
   for (object::SectionRef Section : O.sections()) {
     if (Section.isVirtual() || !Section.isText()) // llvm-objdump does the same.
       continue;
@@ -802,16 +841,52 @@ static void getObjectCoveragePoints(const object::ObjectFile &O,
         continue;
       }
       uint64_t Addr = Index + SectionAddr;
-      // Sanitizer coverage uses the address of the next instruction - 1.
-      uint64_t CovPoint = getPreviousInstructionPc(Addr + Size, TheTriple);
       uint64_t Target;
       if (MIA->isCall(Inst) &&
-          MIA->evaluateBranch(Inst, SectionAddr + Index, Size, Target) &&
-          SanCovAddrs.find(Target) != SanCovAddrs.end())
-        Addrs->insert(CovPoint);
+          MIA->evaluateBranch(Inst, SectionAddr + Index, Size, Target))
+        Fn(Addr + Size, Target);
       MIA->updateState(Inst, STI.get(), Addr);
     }
   }
+}
+
+// Locate addresses of all coverage points in a file. Coverage point
+// is defined as the 'address of instruction following __sanitizer_cov
+// call - 1'.
+static void getObjectCoveragePoints(const object::ObjectFile &O,
+                                    std::set<uint64_t> *Addrs) {
+  auto SanCovAddrs = findSanitizerCovFunctions(O);
+  if (SanCovAddrs.empty())
+    fail("__sanitizer_cov* functions not found");
+
+  // Sanitizer coverage steps back into the call the way the sanitizer runtimes
+  // do, by GetPreviousInstructionPc().
+  Triple TheTriple("unknown-unknown-unknown");
+  TheTriple.setArch(Triple::ArchType(O.getArch()));
+  visitCallSites(O, [&](uint64_t NextAddr, uint64_t Target) {
+    if (SanCovAddrs.count(Target))
+      Addrs->insert(getPreviousInstructionPc(NextAddr, TheTriple));
+  });
+}
+
+// Locate the call sites of the trace-args/trace-ret callbacks in O. A call site
+// is the return address of the call minus one on every target, which is what
+// the callbacks' consumers record (libFuzzer, the kernel's KCOV dataflow); it
+// lies within the call, so it symbolizes to the call's location.
+static void getObjectDataflowPoints(const object::ObjectFile &O,
+                                    std::map<uint64_t, DataflowKind> *Points) {
+  auto ArgsAddrs = findCallbackAddrs(O, isDataflowArgsSymbol);
+  auto RetAddrs = findCallbackAddrs(O, isDataflowRetSymbol);
+  if (ArgsAddrs.empty() && RetAddrs.empty())
+    fail("__sanitizer_cov_trace_args and __sanitizer_cov_trace_ret functions "
+         "not found");
+
+  visitCallSites(O, [&](uint64_t NextAddr, uint64_t Target) {
+    if (ArgsAddrs.count(Target))
+      Points->emplace(NextAddr - 1, DataflowKind::Args);
+    else if (RetAddrs.count(Target))
+      Points->emplace(NextAddr - 1, DataflowKind::Ret);
+  });
 }
 
 static void
@@ -873,6 +948,116 @@ static void printCovPoints(const std::string &ObjFile, raw_ostream &OS) {
     OS.write_hex(Addr);
     OS << "\n";
   }
+}
+
+// Locate the call sites of the trace-args/trace-ret callbacks in a file.
+static std::map<uint64_t, DataflowKind>
+findDataflowPointAddrs(const std::string &FileName) {
+  std::map<uint64_t, DataflowKind> Result;
+  visitObjectFiles(FileName, [&](const object::ObjectFile &O) {
+    getObjectDataflowPoints(O, &Result);
+  });
+  return Result;
+}
+
+// Print the trace-args/trace-ret call sites of a file, one per line:
+// <address> args|ret.
+static void printDataflowPoints(const std::string &ObjFile, raw_ostream &OS) {
+  for (auto [Addr, Kind] : findDataflowPointAddrs(ObjFile)) {
+    OS << "0x";
+    OS.write_hex(Addr);
+    OS << " " << getDataflowKindName(Kind) << "\n";
+  }
+}
+
+// A trace-args/trace-ret call site and the source-level frame it reports for.
+struct DataflowPoint {
+  uint64_t Addr;
+  DataflowKind Kind;
+  // The frame the callback reports for, then every frame it was inlined into,
+  // outward. The compiler gives a trace-args call the location of the frame
+  // whose parameters it reports, inlined callees included, so the innermost
+  // frame names the function the arguments belong to even when that function
+  // has no symbol of its own left.
+  SmallVector<DILineInfo, 2> Frames;
+};
+
+static std::vector<DataflowPoint>
+getDataflowPoints(const std::string &ObjectFile) {
+  std::vector<DataflowPoint> Result;
+  auto Symbolizer(createSymbolizer());
+  Ignorelists Ig;
+
+  for (auto [Addr, Kind] : findDataflowPointAddrs(ObjectFile)) {
+    // TODO: it would be neccessary to set proper section index here.
+    // object::SectionedAddress::UndefSection works for only absolute addresses.
+    auto InliningInfo = Symbolizer->symbolizeInlinedCode(
+        ObjectFile, {Addr, object::SectionedAddress::UndefSection});
+    failIfError(InliningInfo);
+
+    DataflowPoint Point{Addr, Kind, {}};
+    for (uint32_t I = 0; I < InliningInfo->getNumberOfFrames(); ++I) {
+      DILineInfo Frame = InliningInfo->getFrame(I);
+      Frame.FileName = normalizeFilename(Frame.FileName);
+      Point.Frames.push_back(Frame);
+    }
+    // The point belongs to its innermost frame, so that frame decides whether
+    // the ignorelist drops it.
+    if (!Point.Frames.empty() && Ig.isIgnorelisted(Point.Frames.front()))
+      continue;
+    Result.push_back(std::move(Point));
+  }
+  return Result;
+}
+
+// Output symbolized trace-args/trace-ret call sites in JSON.
+// Format:
+// {
+//   '<binary>' : [
+//     {
+//       'pc' : '0x<address>',
+//       'kind' : 'args' | 'ret',
+//       'frames' : [
+//         { 'function' : '<name>', 'file' : '<file>',
+//           'line' : <line>, 'column' : <column> },
+//         ...  (innermost first)
+//       ]
+//     },
+//     ...
+//   ]
+// }
+static void symbolizeDataflowPoints(const std::vector<std::string> &ObjFiles,
+                                    raw_ostream &OS) {
+  // Symbolize everything first, so that a failure does not leave half a JSON
+  // document behind.
+  std::vector<std::pair<std::string, std::vector<DataflowPoint>>> Points;
+  for (const std::string &ObjFile : ObjFiles)
+    Points.emplace_back(ObjFile, getDataflowPoints(ObjFile));
+
+  json::OStream W(OS, 2);
+  W.object([&] {
+    for (const auto &FileAndPoints : Points) {
+      W.attributeArray(FileAndPoints.first, [&] {
+        for (const DataflowPoint &Point : FileAndPoints.second) {
+          W.object([&] {
+            W.attribute("pc", "0x" + utohexstr(Point.Addr, /*LowerCase=*/true));
+            W.attribute("kind", getDataflowKindName(Point.Kind));
+            W.attributeArray("frames", [&] {
+              for (const DILineInfo &Frame : Point.Frames) {
+                W.object([&] {
+                  W.attribute("function", Frame.FunctionName);
+                  W.attribute("file", Frame.FileName);
+                  W.attribute("line", Frame.Line);
+                  W.attribute("column", Frame.Column);
+                });
+              }
+            });
+          });
+        }
+      });
+    }
+  });
+  OS << "\n";
 }
 
 static ErrorOr<bool> isCoverageFile(const std::string &FileName) {
@@ -1268,6 +1453,10 @@ static void parseArgs(int Argc, char **Argv) {
         "symbolized .symcov version.\n"
         "  Depending on chosen action the tool expects different input files:\n"
         "    -print-coverage-pcs     - coverage-instrumented binary files\n"
+        "    -print-dataflow-pcs     - trace-args/trace-ret instrumented "
+        "binary files\n"
+        "    -symbolize-dataflow     - trace-args/trace-ret instrumented "
+        "binary files\n"
         "    -print-coverage         - .sancov files\n"
         "    -diff                   - two .sancov files & --output option\n"
         "    -union                  - one or more .sancov files & --output "
@@ -1303,6 +1492,12 @@ static void parseArgs(int Argc, char **Argv) {
       break;
     case OPT_printCoveragePcs:
       Action = ActionType::PrintCovPointsAction;
+      break;
+    case OPT_printDataflowPcs:
+      Action = ActionType::PrintDataflowPointsAction;
+      break;
+    case OPT_symbolizeDataflow:
+      Action = ActionType::SymbolizeDataflowAction;
       break;
     case OPT_coveredFunctions:
       Action = ActionType::CoveredFunctionsAction;
@@ -1376,6 +1571,17 @@ int sancov_main(int Argc, char **Argv, const llvm::ToolContext &) {
     }
     return 0;
   }
+  if (Action == PrintDataflowPointsAction) {
+    // -print-dataflow-pcs doesn't need coverage files.
+    for (const std::string &ObjFile : ClInputFiles)
+      printDataflowPoints(ObjFile, outs());
+    return 0;
+  }
+  if (Action == SymbolizeDataflowAction) {
+    // -symbolize-dataflow doesn't need coverage files.
+    symbolizeDataflowPoints(ClInputFiles, outs());
+    return 0;
+  }
 
   auto Coverage = readSymbolizeAndMergeCmdArguments(ClInputFiles);
   failIf(!Coverage, "No valid coverage files given.");
@@ -1407,6 +1613,8 @@ int sancov_main(int Argc, char **Argv, const llvm::ToolContext &) {
   case UnionAction:
   case PrintAction:
   case PrintCovPointsAction:
+  case PrintDataflowPointsAction:
+  case SymbolizeDataflowAction:
     llvm_unreachable("unsupported action");
   }
 
