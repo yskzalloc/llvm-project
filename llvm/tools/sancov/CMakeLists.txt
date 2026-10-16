@@ -2,6 +2,8 @@ set(LLVM_LINK_COMPONENTS
   AllTargetsDescs
   AllTargetsDisassemblers
   AllTargetsInfos
+  DebugInfoDWARF
+  Demangle
   MC
   MCDisassembler
   Object

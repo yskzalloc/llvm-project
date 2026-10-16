@@ -1,0 +1,59 @@
+## A hidden IR argument a front end describes with an artificial variable -
+## a Fortran CHARACTER length, Swift type metadata - resolves to that variable,
+## labelled as artificial; a struct whose type DWARF gives no members for, as
+## Swift's, is one opaque field of its size.
+
+REQUIRES: x86-registered-target
+RUN: split-file %s %t
+RUN: opt -passes='module(sancov-module)' -sanitizer-coverage-trace-args %t/hidden.ll -o %t/hidden.bc
+RUN: llc -O2 -filetype=obj %t/hidden.bc -o %t/hidden.o
+RUN: sancov -symbolize-dataflow %t/hidden.o | FileCheck %s
+
+CHECK:      "summary": "IR argument 0 -> source parameter \"s\" [exact: compiler source map]",
+CHECK:      "summary": "IR argument 1 -> artificial variable \".s.len\" [exact: compiler source map]",
+CHECK-NEXT: "parameter": {
+CHECK-NEXT:   "name": ".s.len",
+CHECK-NEXT:   "artificial": true
+CHECK-NEXT: },
+CHECK:      "summary": "IR argument 2 -> source parameter \"o\" [exact: compiler source map]",
+CHECK-NEXT: "parameter": {
+CHECK-NEXT:   "name": "o",
+CHECK-NEXT:   "number": 2
+CHECK-NEXT: },
+CHECK-NEXT: "type": "Opaque",
+CHECK-NEXT: "pieces": [
+CHECK:      "fields": [
+CHECK-NEXT:   {
+CHECK-NEXT:     "name": "o",
+CHECK-NEXT:     "type": "Opaque",
+CHECK-NEXT:     "bit_offset": 0,
+CHECK-NEXT:     "bit_size": 64,
+CHECK-NEXT:     "value_bit_offset": 0
+
+;--- hidden.ll
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @f(i32 noundef %s, i64 noundef %len, i64 noundef %o) !dbg !10 {
+    #dbg_value(i32 %s, !11, !DIExpression(), !14)
+    #dbg_value(i64 %len, !12, !DIExpression(), !14)
+    #dbg_value(i64 %o, !13, !DIExpression(), !14)
+  ret void, !dbg !14
+}
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, isOptimized: true, emissionKind: FullDebug)
+!1 = !DIFile(filename: "hidden.c", directory: "/")
+!2 = !{i32 7, !"Dwarf Version", i32 5}
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!5 = !DIBasicType(name: "long", size: 64, encoding: DW_ATE_signed)
+!6 = !DICompositeType(tag: DW_TAG_structure_type, name: "Opaque", file: !1, size: 64, elements: !{})
+!7 = !DISubroutineType(types: !8)
+!8 = !{null, !4, !6}
+!10 = distinct !DISubprogram(name: "f", scope: !1, file: !1, line: 1, type: !7, scopeLine: 1, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0, retainedNodes: !15)
+!11 = !DILocalVariable(name: "s", arg: 1, scope: !10, file: !1, line: 1, type: !4)
+!12 = !DILocalVariable(name: ".s.len", scope: !10, file: !1, line: 1, type: !5, flags: DIFlagArtificial)
+!13 = !DILocalVariable(name: "o", arg: 2, scope: !10, file: !1, line: 1, type: !6)
+!14 = !DILocation(line: 1, column: 1, scope: !10)
+!15 = !{!11, !12, !13}

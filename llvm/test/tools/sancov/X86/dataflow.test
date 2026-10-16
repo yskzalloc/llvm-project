@@ -33,7 +33,10 @@ NOCOV: ERROR: __sanitizer_cov* functions not found
 RUN: cp %t/disas.txt %t/json.txt
 RUN: sancov -symbolize-dataflow -strip_path_prefix=/tmp/ %t/dataflow.o >> %t/json.txt
 RUN: FileCheck %s --check-prefixes=DISAS,JSON < %t/json.txt
+## In a relocatable object, where every section starts at 0, each point names
+## its section.
 JSON:      "pc": "0x[[#%x,ARGS0+4]]",
+JSON-NEXT: "section": ".text",
 JSON-NEXT: "kind": "args",
 JSON-NEXT: "frames": [
 JSON-NEXT:   {
@@ -44,8 +47,10 @@ JSON-NEXT:     "column": 0
 JSON-NEXT:   }
 JSON-NEXT: ]
 JSON:      "pc": "0x[[#%x,ARGS1+4]]",
+JSON-NEXT: "section": ".text",
 JSON-NEXT: "kind": "args",
 JSON:      "pc": "0x[[#%x,INLINED+4]]",
+JSON-NEXT: "section": ".text",
 JSON-NEXT: "kind": "args",
 JSON-NEXT: "frames": [
 JSON-NEXT:   {
@@ -62,6 +67,7 @@ JSON-NEXT:     "column": 10
 JSON-NEXT:   }
 JSON-NEXT: ]
 JSON:      "pc": "0x[[#%x,RET+4]]",
+JSON-NEXT: "section": ".text",
 JSON-NEXT: "kind": "ret",
 JSON-NEXT: "frames": [
 JSON-NEXT:   {

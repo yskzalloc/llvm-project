@@ -1,0 +1,209 @@
+## Check that `sancov -symbolize-dataflow` resolves each trace-args/trace-ret
+## observation through its observation descriptor and the compiler's debug-only
+## source map to the source parameter, and which bits of it, it holds; that
+## the observation survives stripping debug information; and that without the
+## source map it falls back to a positional guess that is labelled as one, and
+## only where no split aggregate or hidden argument makes it ambiguous.
+##
+## The input is what clang -O2 -g emits for the argument shapes of
+## a set of C and C++ argument shapes on aarch64-linux-gnu. AArch64 passes `struct mix` as one `[2 x i64]`, two observations of IR
+## argument 0, so `z` is IR argument 1; `struct hfa` is `[3 x float]`.
+##
+## The object is relocatable and calls callbacks it does not define: the
+## descriptors locate the call sites through their relocations.
+
+REQUIRES: aarch64-registered-target
+RUN: opt -passes='module(sancov-module)' -sanitizer-coverage-trace-args -sanitizer-coverage-trace-ret \
+RUN:   %S/../../../Instrumentation/SanitizerCoverage/Inputs/trace-args-cases-aarch64.ll -S -o %t.ll
+RUN: llc -O2 -filetype=obj %t.ll -o %t.o
+RUN: sancov -symbolize-dataflow %t.o > %t.json
+RUN: grep '"summary"' %t.json | FileCheck %s --check-prefix=EXACT --match-full-lines
+
+## Debug information stripped: the IR-level observations stay, the source does
+## not.
+RUN: llvm-objcopy --strip-debug %t.o %t.stripped.o
+RUN: sancov -symbolize-dataflow %t.stripped.o > %t.stripped.json
+RUN: grep '"summary"' %t.stripped.json | FileCheck %s --check-prefix=STRIPPED --match-full-lines
+RUN: FileCheck %s --check-prefix=STRIPPED-OBS < %t.stripped.json
+
+## The source map absent, as from a compiler that does not emit it.
+RUN: sed -e 's/ !sancov.dataflow ![0-9]*//' %t.ll | llc -O2 -filetype=obj -o %t.nomap.o
+RUN: sancov -symbolize-dataflow %t.nomap.o > %t.nomap.json
+RUN: grep '"summary"' %t.nomap.json | FileCheck %s --check-prefix=NOMAP --match-full-lines
+
+EXACT:     "summary": "IR argument 0 -> source parameter \"a\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"b\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"p\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"f\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"d\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"double\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"p\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"int\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 element 0 -> source parameter \"m\" bits [0, 64) [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 0 element 1 -> source parameter \"m\" bits [64, 128) [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"double\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 element 0 -> source parameter \"h\" bits [0, 32) [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 0 element 1 -> source parameter \"h\" bits [32, 64) [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 0 element 2 -> source parameter \"h\" bits [64, 96) [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"float\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> address of source parameter \"b\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"x\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"big\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"f\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"a0\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"a1\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 2 -> source parameter \"a2\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 3 -> source parameter \"a3\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 4 -> source parameter \"a4\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 5 -> source parameter \"a5\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 6 -> source parameter \"a6\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 7 -> source parameter \"a7\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 8 -> source parameter \"a8\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 9 -> source parameter \"a9\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"i\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"d\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 2 -> source parameter \"l\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 3 -> source parameter \"f\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"double\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"p\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 element 0 -> source parameter \"m\" bits [0, 64) [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 0 element 1 -> source parameter \"m\" bits [64, 128) [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"z\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"r\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> source parameter \"this\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"f\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NEXT:"summary": "IR argument 0 -> address of source parameter \"n\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "IR argument 1 -> source parameter \"z\" [exact: compiler source map]",
+EXACT-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+EXACT-NOT: summary
+
+STRIPPED:     "summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 element 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 element 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 element 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 element 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 element 2 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 2 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 3 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 4 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 5 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 6 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 7 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 8 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 9 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 2 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 3 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 element 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 element 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 0 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no debug information)"
+STRIPPED-NEXT:"summary": "return value -> source type unresolved (no debug information)"
+STRIPPED-NOT: summary
+
+NOMAP:     "summary": "IR argument 0 -> source parameter \"a\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter \"b\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"p\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"f\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter \"d\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"double\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"p\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"int\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 element 0 -> source parameter \"m\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 0 element 1 -> source parameter \"m\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"double\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 element 0 -> source parameter \"h\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 0 element 1 -> source parameter \"h\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 0 element 2 -> source parameter \"h\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"float\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"b\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter unresolved (no source map, and a hidden IR argument makes positional mapping ambiguous)"
+NOMAP-NEXT:"summary": "return value -> type \"big\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"f\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"a0\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter \"a1\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 2 -> source parameter \"a2\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 3 -> source parameter \"a3\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 4 -> source parameter \"a4\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 5 -> source parameter \"a5\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 6 -> source parameter \"a6\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 7 -> source parameter \"a7\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 8 -> source parameter \"a8\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 9 -> source parameter \"a9\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"i\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter \"d\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 2 -> source parameter \"l\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 3 -> source parameter \"f\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"double\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"p\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 element 0 -> source parameter \"m\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 0 element 1 -> source parameter \"m\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter \"z\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"r\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"this\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter \"f\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NEXT:"summary": "IR argument 0 -> source parameter \"n\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "IR argument 1 -> source parameter \"z\" [heuristic: positional]",
+NOMAP-NEXT:"summary": "return value -> type \"long\" [exact: subprogram return type]",
+NOMAP-NOT: summary
+
+## c05_split's struct mix: the second element of IR argument 0, 8 bytes in.
+STRIPPED-OBS:      "element": 1,
+STRIPPED-OBS-NEXT:   "element_offset": 8,
+STRIPPED-OBS-NEXT:   "class": "integer",
+STRIPPED-OBS-NEXT:   "size": 8,
+STRIPPED-OBS-NEXT:   "flags": [
+STRIPPED-OBS-NEXT:     "element"
+STRIPPED-OBS-NEXT:   ]
+STRIPPED-OBS-NEXT: },
+STRIPPED-OBS-NEXT: "source": {
+STRIPPED-OBS-NEXT:   "provenance": "unresolved",

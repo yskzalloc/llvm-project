@@ -1,0 +1,48 @@
+## Check that `sancov -symbolize-dataflow` skips a __sancov_dataflow descriptor
+## of a version it does not know, says so, and still decodes the others: every
+## entry has the same size, so one it cannot read does not stop it from reading
+## the next. The call site of the skipped descriptor is still found, through the
+## callback the object defines, and reported without an observation.
+
+REQUIRES: x86-registered-target
+RUN: split-file %s %t
+RUN: llc -O0 -filetype=obj %t/version.ll -o %t/version.o
+RUN: sancov -symbolize-dataflow %t/version.o 2> %t/err | FileCheck %s
+RUN: FileCheck %s --check-prefix=WARN --input-file=%t/err
+
+WARN: WARNING: skipped 1 __sancov_dataflow descriptors of an unknown version in {{.*}}version.o
+
+CHECK:      "function": "known",
+CHECK:      "observation": {
+CHECK-NEXT:   "ir_arg": 0,
+CHECK-NEXT:   "ir_args": 1,
+CHECK-NEXT:   "class": "integer",
+CHECK-NEXT:   "size": 4,
+CHECK:      "function": "unknown",
+CHECK-NOT:  "observation"
+CHECK:      "summary": "argument -> source parameter unresolved (no observation descriptor)"
+
+#--- version.ll
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define internal void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32) noinline {
+  ret void
+}
+
+define void @known(i32 %a) {
+  %z = zext i32 %a to i64
+  notail call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %z, ptr null, i32 0), !pcsections !0
+  ret void
+}
+
+define void @unknown(i32 %a) {
+  %z = zext i32 %a to i64
+  notail call void @__sanitizer_cov_trace_args(i32 0, i32 4, i64 %z, ptr null, i32 0), !pcsections !2
+  ret void
+}
+
+!0 = !{!"__sancov_dataflow", !1}
+!1 = !{i8 1, i8 0, i8 1, i8 0, i16 0, i16 1, i16 0, i16 0, i32 4, i32 0}
+!2 = !{!"__sancov_dataflow", !3}
+!3 = !{i8 9, i8 0, i8 1, i8 0, i16 0, i16 1, i16 0, i16 0, i32 4, i32 0}
