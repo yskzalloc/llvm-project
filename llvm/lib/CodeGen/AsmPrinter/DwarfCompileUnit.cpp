@@ -1222,6 +1222,8 @@ DIE &DwarfCompileUnit::constructSubprogramScopeDIE(const DISubprogram *Sub,
     // block's synthetic this pointer.
     if (DIE *ObjectPointer = createAndAddScopeChildren(Scope, ScopeDIE))
       addDIEEntry(ScopeDIE, dwarf::DW_AT_object_pointer, *ObjectPointer);
+    if (!includeMinimalInlineScopes())
+      addSanCovObservations(F, *Scope, ScopeDIE);
   }
 
   // If this is a variadic function, add an unspecified parameter.
@@ -1244,6 +1246,70 @@ DIE &DwarfCompileUnit::constructSubprogramScopeDIE(const DISubprogram *Sub,
 
 bool DwarfCompileUnit::hasGlobalVariableInScope(const DILocalScope *ScopeNode) {
   return GlobalVarScopes.contains(ScopeNode);
+}
+
+void DwarfCompileUnit::addSanCovObservations(const Function &F,
+                                             LexicalScope &Scope,
+                                             DIE &ScopeDIE) {
+  // The SanitizerCoverage source map: which source parameter each trace-args
+  // observation of F holds. See SanitizerCoverage.cpp for its format.
+  const MDNode *Map = F.hasMetadata() ? F.getMetadata("sancov.dataflow")
+                                      : nullptr;
+  if (!Map)
+    return;
+  auto ScopeVars = DU->getScopeVariables().find(&Scope);
+  if (ScopeVars == DU->getScopeVariables().end())
+    return;
+  const auto &Args = ScopeVars->second.Args;
+  auto GetInt = [](const MDOperand &Op) -> std::optional<uint64_t> {
+    if (auto *CI = mdconst::dyn_extract_or_null<ConstantInt>(Op))
+      return CI->getZExtValue();
+    return std::nullopt;
+  };
+  for (const MDOperand &EntryOp : Map->operands()) {
+    auto *Entry = dyn_cast_or_null<MDTuple>(EntryOp.get());
+    if (!Entry || Entry->getNumOperands() != 7)
+      continue;
+    auto *Var = dyn_cast_or_null<DILocalVariable>(Entry->getOperand(2));
+    auto IRArg = GetInt(Entry->getOperand(0));
+    auto Element = GetInt(Entry->getOperand(1));
+    auto Indirect = GetInt(Entry->getOperand(3));
+    auto ValueBit = GetInt(Entry->getOperand(4));
+    auto VarBit = GetInt(Entry->getOperand(5));
+    auto Bits = GetInt(Entry->getOperand(6));
+    if (!Var || !IRArg || !Element || !Indirect || !ValueBit || !VarBit ||
+        !Bits)
+      continue;
+    // The parameter's DIE in this subprogram; without one there is nothing to
+    // refer to.
+    DIE *VarDIE = nullptr;
+    for (const auto &[ArgNo, DV] : Args)
+      if (DV->getVariable() == Var)
+        VarDIE = DV->getDIE();
+    // An artificial variable describing a hidden argument.
+    for (const DbgVariable *DV : ScopeVars->second.Locals)
+      if (!VarDIE && DV->getVariable() == Var)
+        VarDIE = DV->getDIE();
+    if (!VarDIE)
+      continue;
+    DIE &Obs = ScopeDIE.addChild(
+        DIE::get(DIEValueAllocator, dwarf::DW_TAG_LLVM_sancov_observation));
+    addUInt(Obs, dwarf::DW_AT_LLVM_sancov_ir_arg, std::nullopt, *IRArg);
+    addUInt(Obs, dwarf::DW_AT_LLVM_sancov_element, std::nullopt, *Element);
+    addDIEEntry(Obs, dwarf::DW_AT_LLVM_sancov_variable, *VarDIE);
+    if (Var->getArg())
+      addUInt(Obs, dwarf::DW_AT_LLVM_sancov_source_arg, std::nullopt,
+              Var->getArg());
+    if (*Indirect) {
+      addFlag(Obs, dwarf::DW_AT_LLVM_sancov_indirect);
+      continue;
+    }
+    if (*ValueBit)
+      addUInt(Obs, dwarf::DW_AT_LLVM_sancov_value_bit_offset, std::nullopt,
+              *ValueBit);
+    addUInt(Obs, dwarf::DW_AT_data_bit_offset, std::nullopt, *VarBit);
+    addUInt(Obs, dwarf::DW_AT_bit_size, std::nullopt, *Bits);
+  }
 }
 
 DIE *DwarfCompileUnit::createAndAddScopeChildren(LexicalScope *Scope,

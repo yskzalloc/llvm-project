@@ -311,6 +311,11 @@ public:
 
   DIE *createAndAddScopeChildren(LexicalScope *Scope, DIE &ScopeDIE);
 
+  /// Add the DW_TAG_LLVM_sancov_observation children of F's subprogram DIE,
+  /// from F's SanitizerCoverage source map.
+  void addSanCovObservations(const Function &F, LexicalScope &Scope,
+                             DIE &ScopeDIE);
+
   /// Create an abstract subprogram DIE, that should later be populated
   /// by \ref constructAbstractSubprogramScopeDIE.
   DIE &getOrCreateAbstractSubprogramDIE(const DISubprogram *SP);
