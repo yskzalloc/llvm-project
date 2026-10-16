@@ -38,6 +38,12 @@
 ; DESC-NEXT: ]
 ; DESC:      Size: 1272
 ;
+; The source map is debug information: present with it, absent without it,
+; and the only DWARF that refers to the trace calls' observations.
+; RUN: llvm-dwarfdump --debug-info %t.g.o | FileCheck %s --check-prefix=MAP
+; MAP-COUNT-37: DW_TAG_LLVM_sancov_observation
+; MAP-NOT:       DW_TAG_LLVM_sancov_observation
+;
 ; Stripping debug information from the object keeps the descriptors whole.
 ; RUN: llvm-objcopy --strip-debug %t.g.o %t.stripped.o
 ; RUN: llvm-readobj --sections %t.stripped.o | FileCheck %s --check-prefix=NOG
