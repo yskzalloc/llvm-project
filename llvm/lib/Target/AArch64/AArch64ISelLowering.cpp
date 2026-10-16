@@ -11141,6 +11141,10 @@ AArch64TargetLowering::LowerCall(CallLoweringInfo &CLI,
   DAG.addNoMergeSiteInfo(Chain.getNode(), CLI.NoMerge);
   InGlue = Chain.getValue(1);
   DAG.addCallSiteInfo(Chain.getNode(), std::move(CSInfo));
+  // A call has no result to carry !pcsections; keep them on the call.
+  if (CLI.CB)
+    if (MDNode *PCSections = CLI.CB->getMetadata(LLVMContext::MD_pcsections))
+      DAG.addPCSections(Chain.getNode(), PCSections);
   if (CalledGlobal &&
       MF.getFunction().getParent()->getModuleFlag("import-call-optimization"))
     DAG.addCalledGlobal(Chain.getNode(), CalledGlobal, OpFlags);

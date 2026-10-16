@@ -1094,7 +1094,20 @@ bool FastISel::lowerCallTo(CallLoweringInfo &CLI) {
     CLI.OutFlags.push_back(Flags);
   }
 
-  if (!fastLowerCall(CLI))
+  // The !pcsections of a call label the call instruction, not each copy that
+  // sets up its arguments, as SelectionDAG does.
+  MDNode *CallPCSections = MIMD.getPCSections();
+  if (CallPCSections && CLI.CB)
+    MIMD = MIMetadata(MIMD.getDL(), nullptr, MIMD.getMMRAMetadata(),
+                      MIMD.getDeactivationSymbol());
+  bool Lowered = fastLowerCall(CLI);
+  if (CallPCSections && CLI.CB) {
+    MIMD = MIMetadata(MIMD.getDL(), CallPCSections, MIMD.getMMRAMetadata(),
+                      MIMD.getDeactivationSymbol());
+    if (Lowered && CLI.Call)
+      CLI.Call->setPCSections(*MF, CallPCSections);
+  }
+  if (!Lowered)
     return false;
 
   // Set all unused physreg defs as dead.
