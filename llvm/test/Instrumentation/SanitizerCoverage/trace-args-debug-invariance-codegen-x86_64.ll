@@ -19,10 +19,30 @@
 ; G: Name: .debug_info
 ; NOG-NOT: Name: .debug_
 ;
-; .text is byte-identical.
-; RUN: llvm-objcopy --dump-section=.text=%t.g.text %t.g.o
-; RUN: llvm-objcopy --dump-section=.text=%t.nog.text %t.nog.o
+; .text is byte-identical, and so are the observation descriptors, one per
+; trace call, and their relocations.
+; RUN: llvm-objcopy --dump-section=.text=%t.g.text --dump-section=__sancov_dataflow=%t.g.desc %t.g.o
+; RUN: llvm-objcopy --dump-section=.text=%t.nog.text --dump-section=__sancov_dataflow=%t.nog.desc %t.nog.o
 ; RUN: cmp %t.g.text %t.nog.text
+; RUN: cmp %t.g.desc %t.nog.desc
+; RUN: llvm-objdump -r --section=__sancov_dataflow %t.g.o | sed 1,2d > %t.g.rel
+; RUN: llvm-objdump -r --section=__sancov_dataflow %t.nog.o | sed 1,2d > %t.nog.rel
+; RUN: diff %t.g.rel %t.nog.rel
+; RUN: llvm-readobj --sections %t.nog.o | FileCheck %s --check-prefix=DESC
+; DESC:      Name: __sancov_dataflow
+; DESC-NEXT: Type: SHT_PROGBITS
+; DESC-NEXT: Flags [
+; DESC-NEXT:   SHF_ALLOC
+; DESC-NEXT:   SHF_LINK_ORDER
+; DESC-NEXT:   SHF_WRITE
+; DESC-NEXT: ]
+; DESC:      Size: 1248
+;
+; Stripping debug information from the object keeps the descriptors whole.
+; RUN: llvm-objcopy --strip-debug %t.g.o %t.stripped.o
+; RUN: llvm-readobj --sections %t.stripped.o | FileCheck %s --check-prefix=NOG
+; RUN: llvm-objcopy --dump-section=__sancov_dataflow=%t.stripped.desc %t.stripped.o
+; RUN: cmp %t.g.desc %t.stripped.desc
 ;
 ; And it does trace: the same calls in both, one per IR argument or
 ; first-class aggregate element, and one per return.
