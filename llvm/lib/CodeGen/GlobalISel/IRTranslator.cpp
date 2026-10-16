@@ -3848,6 +3848,12 @@ bool IRTranslatorImpl::translateInvoke(const User &U,
   bool LowerInlineAsm = I.isInlineAsm();
   bool NeedEHLabel = true;
 
+  // !pcsections on the invoke describes the call. Keep it off the EH_LABELs
+  // and the branch to the normal destination, which would otherwise each get
+  // a PC of their own.
+  MDNode *PCSections = MIRBuilder.getPCSections();
+  MIRBuilder.setPCSections(nullptr);
+
   // Emit the actual call, bracketed by EH_LABELs so that the MF knows about
   // the region covered by the try.
   MCSymbol *BeginSymbol = nullptr;
@@ -3857,10 +3863,11 @@ bool IRTranslatorImpl::translateInvoke(const User &U,
     MIRBuilder.buildInstr(TargetOpcode::EH_LABEL).addSym(BeginSymbol);
   }
 
-  if (LowerInlineAsm) {
-    if (!translateInlineAsm(I, MIRBuilder))
-      return false;
-  } else if (!translateCallBase(I, MIRBuilder))
+  MIRBuilder.setPCSections(PCSections);
+  bool Translated = LowerInlineAsm ? translateInlineAsm(I, MIRBuilder)
+                                   : translateCallBase(I, MIRBuilder);
+  MIRBuilder.setPCSections(nullptr);
+  if (!Translated)
     return false;
 
   MCSymbol *EndSymbol = nullptr;

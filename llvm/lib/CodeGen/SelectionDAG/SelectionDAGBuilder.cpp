@@ -1384,13 +1384,13 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
   CurInst = &I;
 
   // Set inserted listener only if required.
-  bool NodeInserted = false;
+  SmallVector<SDNode *, 8> InsertedNodes;
   std::unique_ptr<SelectionDAG::DAGNodeInsertedListener> InsertedListener;
   MDNode *PCSectionsMD = I.getMetadata(LLVMContext::MD_pcsections);
   MDNode *MMRA = I.getMetadata(LLVMContext::MD_mmra);
   if (PCSectionsMD || MMRA) {
     InsertedListener = std::make_unique<SelectionDAG::DAGNodeInsertedListener>(
-        DAG, [&](SDNode *) { NodeInserted = true; });
+        DAG, [&](SDNode *N) { InsertedNodes.push_back(N); });
   }
 
   visit(I.getOpcode(), I);
@@ -1401,13 +1401,21 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
 
   // Handle metadata.
   if (PCSectionsMD || MMRA) {
+    // The target's call lowering puts !pcsections on the call node itself: a
+    // call has no result to carry them, or one that is only a copy out of a
+    // return register.
+    bool CallHasPCSections =
+        PCSectionsMD && isa<CallBase>(I) &&
+        any_of(InsertedNodes, [&](SDNode *N) {
+          return DAG.getPCSections(N) == PCSectionsMD;
+        });
     auto It = NodeMap.find(&I);
     if (It != NodeMap.end()) {
-      if (PCSectionsMD)
+      if (PCSectionsMD && !CallHasPCSections)
         DAG.addPCSections(It->second.getNode(), PCSectionsMD);
       if (MMRA)
         DAG.addMMRAMetadata(It->second.getNode(), MMRA);
-    } else if (NodeInserted) {
+    } else if (!InsertedNodes.empty() && (MMRA || !CallHasPCSections)) {
       // This should not happen; if it does, don't let it go unnoticed so we can
       // fix it. Relevant visit*() function is probably missing a setValue().
       errs() << "warning: loosing !pcsections and/or !mmra metadata ["

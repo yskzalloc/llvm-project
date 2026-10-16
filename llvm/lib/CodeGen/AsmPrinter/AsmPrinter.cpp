@@ -1866,7 +1866,7 @@ void AsmPrinter::emitPCSectionsLabel(const MachineFunction &MF,
                                      const MDNode &MD) {
   MCSymbol *S = MF.getContext().createTempSymbol("pcsection");
   OutStreamer->emitLabel(S);
-  PCSectionsSymbols[&MD].emplace_back(S);
+  PCSectionsSymbols.emplace_back(&MD, S);
 }
 
 void AsmPrinter::emitPCSections(const MachineFunction &MF) {
@@ -1956,9 +1956,12 @@ void AsmPrinter::emitPCSections(const MachineFunction &MF) {
   // Emit PCs for function start and function size.
   if (const MDNode *MD = F.getMetadata(LLVMContext::MD_pcsections))
     EmitForMD(*MD, {getFunctionBegin(), getFunctionEnd()}, true);
-  // Emit PCs for instructions collected.
-  for (const auto &MS : PCSectionsSymbols)
-    EmitForMD(*MS.first, MS.second, false);
+  // Emit PCs for instructions collected, in instruction order, each followed
+  // by its own copy of the auxiliary data, as the format documents:
+  // instructions sharing an MDNode must not share one copy of it, or the
+  // entries would not be self-contained.
+  for (const auto &[MD, Sym] : PCSectionsSymbols)
+    EmitForMD(*MD, Sym, false);
   OutStreamer->popSection();
   PCSectionsSymbols.clear();
 }

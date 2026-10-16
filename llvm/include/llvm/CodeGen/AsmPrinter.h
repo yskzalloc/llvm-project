@@ -237,8 +237,9 @@ private:
   /// Output stream for the stack usage file (i.e., .su file).
   std::unique_ptr<raw_fd_ostream> StackUsageStream;
 
-  /// List of symbols to be inserted into PC sections.
-  DenseMap<const MDNode *, SmallVector<const MCSymbol *>> PCSectionsSymbols;
+  /// Symbols to be inserted into PC sections, in instruction order, each with
+  /// the metadata that requested it.
+  SmallVector<std::pair<const MDNode *, const MCSymbol *>> PCSectionsSymbols;
 
   static char ID;
 

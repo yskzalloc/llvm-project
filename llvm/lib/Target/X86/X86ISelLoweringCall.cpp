@@ -2758,6 +2758,10 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   if (CLI.CB)
     if (MDNode *HeapAlloc = CLI.CB->getMetadata("heapallocsite"))
       DAG.addHeapAllocSite(Chain.getNode(), HeapAlloc);
+  // A call has no result to carry !pcsections; keep them on the call.
+  if (CLI.CB)
+    if (MDNode *PCSections = CLI.CB->getMetadata(LLVMContext::MD_pcsections))
+      DAG.addPCSections(Chain.getNode(), PCSections);
 
   // Create the CALLSEQ_END node.
   unsigned NumBytesForCalleeToPop = 0; // Callee pops nothing.
