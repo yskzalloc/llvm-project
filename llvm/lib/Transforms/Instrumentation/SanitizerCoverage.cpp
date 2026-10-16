@@ -14,14 +14,17 @@
 #include "InstrumentationOptions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DebugProgramInstruction.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/Function.h"
@@ -1655,6 +1658,580 @@ ModuleSanitizerCoverage::getFunctionObservation(Function &F) {
   return Obs;
 }
 
+// The debug-only source map
+// -------------------------
+//
+// When the function has debug information, the pass records which source
+// parameter each argument observation holds, as the IR's debug records say at
+// the point the pass runs. After code generation that association is lost for
+// floating-point and stack-passed arguments, coerced and split structs, and
+// the parameters of functions returning indirectly; the debug records still
+// have it exactly.
+//
+// The map is the `!sancov.dataflow` attachment of the function: one tuple per
+// piece of an observation that holds bits of a source parameter,
+//
+//   !{i32 IR argument, i32 element, DILocalVariable, i1 indirect,
+//     i64 value bit offset, i64 variable bit offset, i64 bit size}
+//
+// meaning bits [value bit offset, + bit size) of the observed value are bits
+// [variable bit offset, + bit size) of the parameter, or, if indirect, that the
+// observed value is the address of the parameter. The DWARF backend lowers it
+// to DW_TAG_LLVM_sancov_observation children of the function's subprogram,
+// referring to the parameter's DIE; nothing but debug information refers to
+// it, and stripping debug information removes it. It is computed after the
+// observations are fixed and changes none of them.
+//
+// What counts as evidence, all in the entry block and for parameters of the
+// function's own subprogram (records inlined from callees describe other
+// functions' parameters):
+//
+// - The first #dbg_value or #dbg_assign of each parameter fragment whose value
+//   is an argument, an element of a first-class aggregate argument, or bits of
+//   one through trunc, lshr by a constant, zext, sext, bitcast or freeze, with
+//   no other expression than the fragment, or a DW_OP_deref of a pointer
+//   argument (the argument is the parameter's address).
+// - A #dbg_declare of a pointer argument: the argument is the parameter's
+//   address, as clang describes a byval struct.
+// - The first store of an argument, or bits of one, to an alloca a
+//   #dbg_declare describes, at a constant offset: what -O0 does with every
+//   parameter. Only on little-endian targets, where the bits of a stored
+//   value are the bits of memory in order.
+// - A fragment whose value was optimized out completes a first-class aggregate
+//   argument whose other elements map to the same parameter at one consistent
+//   offset, if it covers exactly the missing element: AArch64 passes
+//   `struct mix { double d; long l; }` as `[2 x i64]`, and when only `l` is
+//   used the record of `d` becomes poison.
+//
+// An observation whose pieces name more than one parameter, or map one bit to
+// two places, is left out rather than guessed.
+namespace {
+/// Bits [BitOffset, BitOffset + Width) of observation (Arg, Element), where
+/// Element is -1 for the whole argument.
+struct ArgBits {
+  const Argument *Arg = nullptr;
+  int Element = -1;
+  uint64_t BitOffset = 0;
+  uint64_t Width = 0;
+  /// Whether the bits above Width are the zeros above the argument in the
+  /// reported value, which is zero-extended: then zero-extending the bits
+  /// still describes bits of the reported value.
+  bool ZeroAbove = true;
+
+  /// Zero-extend to \p Bits bits, if that still describes the value.
+  void zeroExtend(uint64_t Bits) {
+    if (ZeroAbove && Bits > Width)
+      Width = std::max(Width, std::min<uint64_t>(Bits, 64 - BitOffset));
+  }
+  void truncate(uint64_t Bits) {
+    if (Bits < Width) {
+      Width = Bits;
+      ZeroAbove = false;
+    }
+  }
+};
+
+struct MapPiece {
+  unsigned IRArg;
+  unsigned Element;
+  DILocalVariable *Var;
+  bool Indirect;
+  uint64_t ValueBit;
+  uint64_t VarBit;
+  uint64_t Bits;
+};
+} // namespace
+
+static uint64_t getValueBits(const DataLayout &DL, Type *Ty) {
+  if (Ty->isPointerTy())
+    return DL.getPointerSizeInBits(Ty->getPointerAddressSpace());
+  if (Ty->isIntegerTy() || Ty->isFloatingPointTy() || Ty->isVectorTy()) {
+    TypeSize Bits = DL.getTypeSizeInBits(Ty);
+    return Bits.isScalable() ? 0 : Bits.getFixedValue();
+  }
+  return 0;
+}
+
+/// Byte offset of element \p I of first-class aggregate type \p Ty.
+static uint64_t getElementOffset(const DataLayout &DL, Type *Ty, unsigned I) {
+  if (auto *STy = dyn_cast<StructType>(Ty))
+    return DL.getStructLayout(STy)->getElementOffset(I).getFixedValue();
+  return I * DL.getTypeAllocSize(Ty->getArrayElementType()).getFixedValue();
+}
+
+/// Which bits of which argument observation \p V is, if it is bits of one.
+static std::optional<ArgBits> resolveArgBits(const DataLayout &DL,
+                                             const Function &F, Value *V,
+                                             unsigned Depth = 0) {
+  if (auto *A = dyn_cast<Argument>(V)) {
+    if (A->getParent() != &F)
+      return std::nullopt;
+    Type *Ty = A->getType();
+    if (Ty->isStructTy() || Ty->isArrayTy())
+      return ArgBits{A, -1, 0, 0};
+    uint64_t Bits = getValueBits(DL, Ty);
+    if (!Bits)
+      return std::nullopt;
+    return ArgBits{A, -1, 0, Bits};
+  }
+  if (Depth > 8)
+    return std::nullopt;
+  if (auto *EV = dyn_cast<ExtractValueInst>(V)) {
+    // An element of an aggregate built from arguments, as flang builds a
+    // CHARACTER's {address, length}: the element inserted there.
+    if (Value *Inserted =
+            FindInsertedValue(EV->getAggregateOperand(), EV->getIndices()))
+      if (Inserted != EV && !isa<ExtractValueInst>(Inserted))
+        return resolveArgBits(DL, F, Inserted, Depth + 1);
+    auto *A = dyn_cast<Argument>(EV->getAggregateOperand());
+    uint64_t Bits = getValueBits(DL, EV->getType());
+    if (!A || A->getParent() != &F || EV->getNumIndices() != 1 || !Bits)
+      return std::nullopt;
+    return ArgBits{A, static_cast<int>(EV->getIndices()[0]), 0, Bits};
+  }
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return std::nullopt;
+  switch (I->getOpcode()) {
+  case Instruction::Trunc: {
+    auto R = resolveArgBits(DL, F, I->getOperand(0), Depth + 1);
+    uint64_t Bits = getValueBits(DL, I->getType());
+    if (!R || !R->Width || Bits > R->Width)
+      return std::nullopt;
+    R->truncate(Bits);
+    return R;
+  }
+  case Instruction::LShr: {
+    auto *Amt = dyn_cast<ConstantInt>(I->getOperand(1));
+    auto R = resolveArgBits(DL, F, I->getOperand(0), Depth + 1);
+    if (!Amt || !R || Amt->getZExtValue() >= R->Width)
+      return std::nullopt;
+    R->BitOffset += Amt->getZExtValue();
+    R->Width -= Amt->getZExtValue();
+    return R;
+  }
+  case Instruction::ZExt:
+  case Instruction::SExt:
+  case Instruction::BitCast:
+  case Instruction::Freeze: {
+    // The bits above the operand's are not the argument's, unless they are
+    // zeros where the reported value has zeros too.
+    auto R = resolveArgBits(DL, F, I->getOperand(0), Depth + 1);
+    if (!R || !R->Width)
+      return std::nullopt;
+    if (I->getOpcode() == Instruction::ZExt)
+      R->zeroExtend(getValueBits(DL, I->getType()));
+    else if (I->getOpcode() == Instruction::SExt)
+      R->ZeroAbove = false;
+    return R;
+  }
+  default:
+    return std::nullopt;
+  }
+}
+
+/// Add the pieces saying bits \p Bits of an argument are \p Var from bit
+/// \p VarBit on, at most \p VarBits of them.
+static void addDirectPieces(const DataLayout &DL, const ArgBits &Bits,
+                            DILocalVariable *Var, uint64_t VarBit,
+                            uint64_t VarBits,
+                            SmallVectorImpl<MapPiece> &Pieces) {
+  const Argument *A = Bits.Arg;
+  Type *Ty = A->getType();
+  auto Add = [&](unsigned Element, uint64_t ValueBit, uint64_t VarOff,
+                 uint64_t Width) {
+    if (VarOff >= VarBit + VarBits)
+      return;
+    Width = std::min(Width, VarBit + VarBits - VarOff);
+    if (Width)
+      Pieces.push_back(
+          {A->getArgNo(), Element, Var, false, ValueBit, VarOff, Width});
+  };
+  if (Bits.Element >= 0 || (!Ty->isStructTy() && !Ty->isArrayTy())) {
+    Add(std::max(Bits.Element, 0), Bits.BitOffset, VarBit, Bits.Width);
+    return;
+  }
+  // A whole first-class aggregate: its elements, at their layout offsets.
+  unsigned N =
+      Ty->isStructTy() ? Ty->getStructNumElements() : Ty->getArrayNumElements();
+  for (unsigned E = 0; E != N; ++E) {
+    Type *ETy = Ty->isStructTy() ? Ty->getStructElementType(E)
+                                 : Ty->getArrayElementType();
+    if (uint64_t W = getValueBits(DL, ETy))
+      Add(E, 0, VarBit + 8 * getElementOffset(DL, Ty, E), W);
+  }
+}
+
+static MDNode *buildSourceMap(Function &F, const DataLayout &DL) {
+  DISubprogram *SP = F.getSubprogram();
+  if (!SP || F.empty())
+    return nullptr;
+  BasicBlock &Entry = F.getEntryBlock();
+
+  // A parameter, or an artificial variable the front end describes a hidden
+  // argument with: a Fortran CHARACTER length, Swift type metadata. Both
+  // directly in the function's own scope.
+  auto IsOwnParameter = [&](const DbgVariableRecord &DVR) {
+    DILocalVariable *Var = DVR.getVariable();
+    return Var && (Var->getArg() || Var->isArtificial()) &&
+           Var->getScope() == SP && !DVR.getDebugLoc().getInlinedAt();
+  };
+  // The fragment of a record, and what its expression does to the value
+  // before that: nothing, a DW_OP_deref (the value is the parameter's
+  // address), or what salvaging a deleted trunc, zext, sext, lshr or mask left
+  // behind - DW_OP_LLVM_convert, DW_OP_constu N DW_OP_shr, DW_OP_constu
+  // 2^k-1 DW_OP_and, ending in DW_OP_stack_value. Anything else computes a
+  // value the argument's bits are not.
+  struct Frag {
+    uint64_t Offset, Size;
+    bool Deref;
+    SmallVector<std::pair<uint64_t, uint64_t>, 4> Ops; // Opcode, operand.
+  };
+  auto GetFrag = [](const DbgVariableRecord &DVR) -> std::optional<Frag> {
+    const DIExpression *Expr = DVR.getExpression();
+    Frag Fr{0, 0, false, {}};
+    bool StackValue = false;
+    std::optional<uint64_t> Const;
+    for (auto Op : Expr->expr_ops()) {
+      switch (Op.getOp()) {
+      case dwarf::DW_OP_LLVM_fragment:
+        continue;
+      case dwarf::DW_OP_deref:
+        if (Fr.Deref || !Fr.Ops.empty() || Const || StackValue)
+          return std::nullopt;
+        Fr.Deref = true;
+        continue;
+      case dwarf::DW_OP_stack_value:
+        StackValue = true;
+        continue;
+      case dwarf::DW_OP_LLVM_convert:
+        if (Fr.Deref || Const || StackValue)
+          return std::nullopt;
+        Fr.Ops.push_back(
+            {Op.getArg(1) == dwarf::DW_ATE_signed ||
+                     Op.getArg(1) == dwarf::DW_ATE_signed_char
+                 ? dwarf::DW_OP_LLVM_convert | (1u << 16)
+                 : dwarf::DW_OP_LLVM_convert,
+             Op.getArg(0)});
+        continue;
+      case dwarf::DW_OP_constu:
+        if (Fr.Deref || Const || StackValue)
+          return std::nullopt;
+        Const = Op.getArg(0);
+        continue;
+      case dwarf::DW_OP_shr:
+      case dwarf::DW_OP_and:
+        if (!Const || StackValue)
+          return std::nullopt;
+        Fr.Ops.push_back({Op.getOp(), *Const});
+        Const.reset();
+        continue;
+      default:
+        return std::nullopt;
+      }
+    }
+    // A computed value has to be marked as one, and nothing may be left over.
+    if (Const || StackValue != !Fr.Ops.empty())
+      return std::nullopt;
+    if (auto FI = Expr->getFragmentInfo()) {
+      Fr.Offset = FI->OffsetInBits;
+      Fr.Size = FI->SizeInBits;
+      return Fr;
+    }
+    std::optional<uint64_t> VarSize = DVR.getVariable()->getSizeInBits();
+    Fr.Size = VarSize && *VarSize ? *VarSize : ~0ULL >> 1;
+    return Fr;
+  };
+  // Apply what a record's expression does to the bits it starts from.
+  auto ApplyOps = [](ArgBits &Bits, const Frag &Fr) {
+    for (auto [Op, N] : Fr.Ops) {
+      if ((Op & 0xffff) == dwarf::DW_OP_LLVM_convert) {
+        if (N < Bits.Width)
+          Bits.truncate(N);
+        else if (Op >> 16)
+          Bits.ZeroAbove = false; // Sign-extended: not the reported zeros.
+        else
+          Bits.zeroExtend(N);
+      } else if (Op == dwarf::DW_OP_shr) {
+        if (N >= Bits.Width)
+          return false;
+        Bits.BitOffset += N;
+        Bits.Width -= N;
+      } else if (Op == dwarf::DW_OP_and) {
+        if (!isMask_64(N))
+          return false;
+        Bits.truncate(llvm::bit_width(N));
+      }
+    }
+    return Bits.Width != 0;
+  };
+
+  SmallVector<MapPiece, 8> Pieces;
+  // Fragments whose value was optimized out, per parameter.
+  SmallVector<std::tuple<DILocalVariable *, uint64_t, uint64_t>, 4> Killed;
+  // Allocas holding a parameter: the parameter, the offset of the alloca in
+  // it, and whether the alloca holds its address instead.
+  SmallVector<std::tuple<const Value *, DILocalVariable *, uint64_t, bool>, 4>
+      Declared;
+  SmallSet<std::tuple<DILocalVariable *, uint64_t, uint64_t>, 8> Seen;
+
+  for (Instruction &I : Entry) {
+    for (DbgVariableRecord &DVR : filterDbgVars(I.getDbgRecordRange())) {
+      if (!IsOwnParameter(DVR) || DVR.hasArgList())
+        continue;
+      std::optional<Frag> Fr = GetFrag(DVR);
+      if (!Fr)
+        continue;
+      DILocalVariable *Var = DVR.getVariable();
+      // Only the first record of each fragment describes the parameter as it
+      // was passed.
+      if (!Seen.insert({Var, Fr->Offset, Fr->Size}).second)
+        continue;
+      Value *V = DVR.getVariableLocationOp(0);
+      if (DVR.isDbgDeclare()) {
+        if (!Fr->Ops.empty())
+          continue;
+        std::optional<ArgBits> Ptr =
+            V && V->getType()->isPointerTy() ? resolveArgBits(DL, F, V)
+                                             : std::nullopt;
+        if (Ptr && Ptr->Element < 0 && !Ptr->BitOffset &&
+            Ptr->Arg->getType()->isPointerTy()) {
+          // The parameter's storage is the memory an argument points to.
+          if (!Fr->Deref && !Fr->Offset)
+            Pieces.push_back({Ptr->Arg->getArgNo(), 0, Var, true, 0, 0, 0});
+        } else if (V) {
+          Declared.push_back({V, Var, Fr->Offset, Fr->Deref});
+        }
+        continue;
+      }
+      if (DVR.isKillLocation()) {
+        Killed.push_back({Var, Fr->Offset, Fr->Size});
+        continue;
+      }
+      std::optional<ArgBits> Bits = resolveArgBits(DL, F, V);
+      if (!Bits || (!Fr->Ops.empty() && (!Bits->Width || !ApplyOps(*Bits, *Fr))))
+        continue;
+      if (Fr->Deref) {
+        // The argument is the parameter's address.
+        if (Bits->Element < 0 && !Bits->BitOffset && !Fr->Offset &&
+            Bits->Arg->getType()->isPointerTy())
+          Pieces.push_back({Bits->Arg->getArgNo(), 0, Var, true, 0, 0, 0});
+        continue;
+      }
+      addDirectPieces(DL, *Bits, Var, Fr->Offset, Fr->Size, Pieces);
+    }
+  }
+
+  // -O0: the arguments are stored to the allocas declared above, directly or
+  // through a temporary that is then copied into them, as a struct coerced
+  // into several IR arguments is.
+  if (DL.isLittleEndian() && !Declared.empty()) {
+    // The first store to each (base, offset), with what it stored.
+    std::map<std::pair<const Value *, uint64_t>, ArgBits> Stored;
+    auto BaseAndOffset =
+        [&](Value *Ptr) -> std::optional<std::pair<const Value *, uint64_t>> {
+      APInt Off(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+      const Value *Base = Ptr->stripAndAccumulateConstantOffsets(
+          DL, Off, /*AllowNonInbounds=*/true);
+      if (Off.isNegative())
+        return std::nullopt;
+      return std::make_pair(Base, Off.getZExtValue());
+    };
+    for (Instruction &I : Entry) {
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        auto Loc = BaseAndOffset(SI->getPointerOperand());
+        if (!Loc || SI->isVolatile())
+          continue;
+        // A value loaded back from memory the arguments were stored to, as
+        // front ends copy a coerced argument into its variable at -O0: what
+        // was stored there.
+        auto *LI = dyn_cast<LoadInst>(SI->getValueOperand());
+        auto From = LI && !LI->isVolatile()
+                        ? BaseAndOffset(LI->getPointerOperand())
+                        : std::nullopt;
+        if (From) {
+          uint64_t Size =
+              DL.getTypeStoreSize(LI->getType()).getKnownMinValue();
+          SmallVector<std::pair<uint64_t, ArgBits>, 4> Copied;
+          for (auto &[SLoc, Bits] : Stored) {
+            if (SLoc.first != From->first || !Bits.Arg)
+              continue;
+            uint64_t Bytes =
+                Bits.Width ? divideCeil(Bits.Width, 8)
+                           : DL.getTypeStoreSize(Bits.Arg->getType())
+                                 .getFixedValue();
+            if (SLoc.second >= From->second &&
+                SLoc.second + Bytes <= From->second + Size) {
+              // Wholly within what was loaded.
+              Copied.push_back(
+                  {Loc->second + (SLoc.second - From->second), Bits});
+            } else if (SLoc.second <= From->second &&
+                       From->second + Size <= SLoc.second + Bytes &&
+                       Bits.Width) {
+              // Part of what was stored: some of its bits.
+              ArgBits Part = Bits;
+              Part.BitOffset += 8 * (From->second - SLoc.second);
+              Part.Width -= 8 * (From->second - SLoc.second);
+              Part.truncate(8 * Size);
+              Copied.push_back({Loc->second, Part});
+            }
+          }
+          for (auto &[Off, Bits] : Copied)
+            Stored.try_emplace({Loc->first, Off}, Bits);
+          Stored.try_emplace(*Loc, ArgBits());
+          continue;
+        }
+        if (std::optional<ArgBits> Bits =
+                resolveArgBits(DL, F, SI->getValueOperand()))
+          Stored.try_emplace(*Loc, *Bits);
+        else
+          Stored.try_emplace(*Loc, ArgBits()); // Something else got there first.
+        continue;
+      }
+      auto *MC = dyn_cast<MemCpyInst>(&I);
+      auto *Len = MC ? dyn_cast<ConstantInt>(MC->getLength()) : nullptr;
+      if (!Len || MC->isVolatile())
+        continue;
+      auto Dst = BaseAndOffset(MC->getRawDest());
+      auto Src = BaseAndOffset(MC->getRawSource());
+      if (!Dst || !Src)
+        continue;
+      SmallVector<std::pair<uint64_t, ArgBits>, 4> Copied;
+      for (auto &[Loc, Bits] : Stored) {
+        uint64_t Bytes =
+            !Bits.Arg    ? 1
+            : Bits.Width ? divideCeil(Bits.Width, 8)
+                         : DL.getTypeStoreSize(Bits.Arg->getType())
+                               .getFixedValue();
+        if (Loc.first == Src->first && Loc.second >= Src->second &&
+            Loc.second + Bytes <= Src->second + Len->getZExtValue())
+          Copied.push_back({Dst->second + (Loc.second - Src->second), Bits});
+      }
+      for (auto &[Off, Bits] : Copied)
+        Stored.try_emplace({Dst->first, Off}, Bits);
+    }
+    for (auto &[Alloca, Var, VarOff, Deref] : Declared) {
+      for (auto &[Loc, Bits] : Stored) {
+        if (Loc.first != Alloca || !Bits.Arg)
+          continue;
+        if (Deref) {
+          if (!Loc.second && Bits.Element < 0 && !Bits.BitOffset &&
+              Bits.Arg->getType()->isPointerTy())
+            Pieces.push_back({Bits.Arg->getArgNo(), 0, Var, true, 0, 0, 0});
+          continue;
+        }
+        uint64_t VarBits = Var->getSizeInBits().value_or(~0ULL >> 1);
+        addDirectPieces(DL, Bits, Var, VarOff + 8 * Loc.second, VarBits,
+                        Pieces);
+      }
+    }
+  }
+
+  // Complete first-class aggregates whose missing element is a fragment that
+  // was optimized out, of a parameter the other elements map to at one offset.
+  for (Argument &A : F.args()) {
+    Type *Ty = A.getType();
+    if (!Ty->isStructTy() && !Ty->isArrayTy())
+      continue;
+    unsigned N = Ty->isStructTy() ? Ty->getStructNumElements()
+                                  : Ty->getArrayNumElements();
+    DILocalVariable *Var = nullptr;
+    std::optional<int64_t> Delta;
+    bool Consistent = true;
+    SmallBitVector Mapped(N);
+    for (const MapPiece &P : Pieces) {
+      if (P.IRArg != A.getArgNo() || P.Indirect)
+        continue;
+      int64_t D = int64_t(P.VarBit) -
+                  int64_t(8 * getElementOffset(DL, Ty, P.Element) + P.ValueBit);
+      if ((Var && Var != P.Var) || (Delta && *Delta != D))
+        Consistent = false;
+      Var = P.Var;
+      Delta = D;
+      Mapped.set(P.Element);
+    }
+    if (!Var || !Consistent)
+      continue;
+    for (unsigned E = 0; E != N; ++E) {
+      if (Mapped.test(E))
+        continue;
+      Type *ETy = Ty->isStructTy() ? Ty->getStructElementType(E)
+                                   : Ty->getArrayElementType();
+      uint64_t W = getValueBits(DL, ETy);
+      int64_t VarBit = int64_t(8 * getElementOffset(DL, Ty, E)) + *Delta;
+      if (W && VarBit >= 0 &&
+          is_contained(Killed, std::make_tuple(Var, uint64_t(VarBit), W)))
+        Pieces.push_back({A.getArgNo(), E, Var, false, 0, uint64_t(VarBit), W});
+    }
+  }
+
+  // A parameter claiming an observation outranks an artificial variable
+  // describing it too, such as a C++ range-for's __range.
+  SmallSet<std::pair<unsigned, unsigned>, 8> ClaimedByParameter;
+  for (const MapPiece &P : Pieces)
+    if (P.Var->getArg())
+      ClaimedByParameter.insert({P.IRArg, P.Element});
+  llvm::erase_if(Pieces, [&](const MapPiece &P) {
+    return !P.Var->getArg() && ClaimedByParameter.count({P.IRArg, P.Element});
+  });
+
+  // One parameter per observation, each bit mapped once; then merge pieces
+  // that continue each other.
+  llvm::sort(Pieces, [](const MapPiece &L, const MapPiece &R) {
+    return std::tie(L.IRArg, L.Element, L.ValueBit, L.VarBit) <
+           std::tie(R.IRArg, R.Element, R.ValueBit, R.VarBit);
+  });
+  SmallVector<MapPiece, 8> Result;
+  for (size_t I = 0, E = Pieces.size(); I != E;) {
+    size_t J = I;
+    bool Ok = true;
+    while (J != E && Pieces[J].IRArg == Pieces[I].IRArg &&
+           Pieces[J].Element == Pieces[I].Element) {
+      if (Pieces[J].Var != Pieces[I].Var ||
+          Pieces[J].Indirect != Pieces[I].Indirect)
+        Ok = false;
+      ++J;
+    }
+    SmallVector<MapPiece, 4> Group;
+    for (size_t K = I; Ok && K != J; ++K) {
+      const MapPiece &P = Pieces[K];
+      if (!Group.empty()) {
+        MapPiece &Last = Group.back();
+        if (P.Indirect || (P.ValueBit == Last.ValueBit &&
+                           P.VarBit == Last.VarBit && P.Bits == Last.Bits))
+          continue; // The same evidence twice.
+        if (P.ValueBit < Last.ValueBit + Last.Bits) {
+          Ok = false; // One bit in two places.
+          break;
+        }
+        if (P.ValueBit == Last.ValueBit + Last.Bits &&
+            P.VarBit == Last.VarBit + Last.Bits) {
+          Last.Bits += P.Bits;
+          continue;
+        }
+      }
+      Group.push_back(P);
+    }
+    if (Ok)
+      append_range(Result, Group);
+    I = J;
+  }
+  if (Result.empty())
+    return nullptr;
+
+  LLVMContext &Ctx = F.getContext();
+  auto Int = [&](unsigned Bits, uint64_t V) {
+    return ConstantAsMetadata::get(
+        ConstantInt::get(IntegerType::get(Ctx, Bits), V));
+  };
+  SmallVector<Metadata *, 8> Entries;
+  for (const MapPiece &P : Result)
+    Entries.push_back(MDTuple::get(
+        Ctx, {Int(32, P.IRArg), Int(32, P.Element), P.Var, Int(1, P.Indirect),
+              Int(64, P.ValueBit), Int(64, P.VarBit), Int(64, P.Bits)}));
+  return MDTuple::get(Ctx, Entries);
+}
+
 void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
   BasicBlock &EntryBB = F.getEntryBlock();
   BasicBlock::iterator IP = EntryBB.getFirstInsertionPt();
@@ -1711,6 +2288,10 @@ void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
       traceValue(IRB, SanCovTraceArgsFunc, Prefix, &Arg, Obs);
     }
   }
+
+  // Only now, with the observations fixed, may debug information be read.
+  if (MDNode *Map = buildSourceMap(F, *DL))
+    F.setMetadata("sancov.dataflow", Map);
 }
 
 void ModuleSanitizerCoverage::InjectTraceForRet(Function &F) {
