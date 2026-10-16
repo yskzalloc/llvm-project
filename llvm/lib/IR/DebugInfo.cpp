@@ -684,6 +684,11 @@ bool llvm::stripDebugInfo(Function &F) {
     Changed = true;
     F.setSubprogram(nullptr);
   }
+  // The SanitizerCoverage source map points into the DILocalVariable system.
+  if (F.hasMetadata() && F.getMetadata("sancov.dataflow")) {
+    Changed = true;
+    F.setMetadata("sancov.dataflow", nullptr);
+  }
 
   DenseMap<MDNode *, MDNode *> LoopIDsMap;
   for (BasicBlock &BB : F) {
@@ -991,6 +996,12 @@ bool llvm::stripNonLineTableDebugInfo(Module &M) {
       auto *NewSP = cast<DISubprogram>(Mapper.mapNode(SP));
       Changed |= SP != NewSP;
       F.setSubprogram(NewSP);
+    }
+    // Line tables have no variables for the SanitizerCoverage source map to
+    // point at.
+    if (F.hasMetadata() && F.getMetadata("sancov.dataflow")) {
+      Changed = true;
+      F.setMetadata("sancov.dataflow", nullptr);
     }
     for (auto &BB : F) {
       for (auto &I : BB) {
