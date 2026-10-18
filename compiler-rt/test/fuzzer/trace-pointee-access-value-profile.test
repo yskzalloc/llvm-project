@@ -1,0 +1,18 @@
+REQUIRES: linux
+The values a function loads and stores through a plain pointer argument,
+recorded as access records, are value-profile features like argument values:
+with -sanitizer-coverage-trace-pointee-access, inputs that make Fold() load
+new values are new coverage under -use_value_profile=1; without it, Fold()'s
+arguments are the same pointers every time, and only the few new edges of a
+longer input are.
+RUN: %cpp_compiler -fsanitize-coverage=trace-args -fno-sanitize-coverage=trace-cmp \
+RUN:   -mllvm -sanitizer-coverage-trace-pointee-access \
+RUN:   %S/TracePointeeAccessTest.cpp -o %t-Access
+RUN: %cpp_compiler -fsanitize-coverage=trace-args -fno-sanitize-coverage=trace-cmp \
+RUN:   %S/TracePointeeAccessTest.cpp -o %t-NoAccess
+RUN: %run %t-Access -seed=1 -runs=2000 -use_value_profile=1 -use_cmp=0 -print_final_stats=1 2>&1 \
+RUN:   | FileCheck %s --check-prefix=ACCESS
+RUN: %run %t-NoAccess -seed=1 -runs=2000 -use_value_profile=1 -use_cmp=0 -print_final_stats=1 2>&1 \
+RUN:   | FileCheck %s --check-prefix=NOACCESS
+ACCESS:   stat::new_units_added: {{[1-9][0-9][0-9]+$}}
+NOACCESS: stat::new_units_added: {{[0-3]$}}

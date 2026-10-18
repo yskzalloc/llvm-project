@@ -513,7 +513,9 @@ void __sanitizer_cov_trace_cmp8(uint64_t Arg1, uint64_t Arg2) {
 // than on the instruction after it. Every observation - each IR argument, each
 // element of a first-class aggregate, each return - has a call site of its own,
 // so the PC identifies it. The observed value is folded into the value
-// profile.
+// profile. So is the value of an access record
+// (-sanitizer-coverage-trace-pointee-access): its arg_idx, with bit 31 set,
+// keeps it apart from the argument's own value.
 ATTRIBUTE_INTERFACE
 ATTRIBUTE_NO_SANITIZE_ALL
 void __sanitizer_cov_trace_args(uint32_t ArgIdx, uint32_t Size, uint64_t Val,
