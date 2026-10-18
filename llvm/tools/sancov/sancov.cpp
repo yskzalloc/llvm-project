@@ -637,11 +637,21 @@ static bool isCoveragePointSymbol(StringRef Name) {
 
 // The two callbacks of -fsanitize-coverage=trace-args,trace-ret. Their call
 // sites are not coverage points: one function has a trace-args call per
-// parameter and a trace-ret call per return, so they are reported apart.
-enum class DataflowKind { Args, Ret };
+// parameter and a trace-ret call per return, so they are reported apart. A
+// trace-args call whose descriptor says it reports a load or store through a
+// pointer argument (-sanitizer-coverage-trace-pointee-access) is an access.
+enum class DataflowKind { Args, Ret, Access };
 
 static StringRef getDataflowKindName(DataflowKind Kind) {
-  return Kind == DataflowKind::Args ? "args" : "ret";
+  switch (Kind) {
+  case DataflowKind::Args:
+    return "args";
+  case DataflowKind::Ret:
+    return "ret";
+  case DataflowKind::Access:
+    return "access";
+  }
+  llvm_unreachable("bad dataflow kind");
 }
 
 static std::optional<DataflowKind> getDataflowCallbackKind(StringRef Name) {
@@ -895,18 +905,60 @@ struct DataflowDescriptor {
     F_HiddenArgs = 1 << 4,
     F_Unused = 1 << 5,
     F_Pointee = 1 << 6,
+    F_Access = 1 << 7,
   };
+  // The access kind of an access record.
+  enum : uint8_t {
+    AK_Store = 1 << 0,
+    AK_Volatile = 1 << 1,
+    AK_Atomic = 1 << 2,
+  };
+  uint8_t Version = 0;
   uint8_t Flags = 0;
   uint8_t Class = 0;
+  uint8_t AccessKind = 0;
   uint16_t IRArg = 0;
   uint16_t IRArgCount = 0;
   uint16_t Element = 0;
+  uint16_t AccessSize = 0;
   uint32_t Size = 0;
   uint32_t ElementOffset = 0;
+
+  bool isAccess() const { return Flags & F_Access; }
+  // The signed byte offset of an access piece from its pointer.
+  int64_t accessOffset() const { return static_cast<int32_t>(ElementOffset); }
+  // The llvm::AtomicOrdering of an atomic access.
+  unsigned accessOrdering() const { return (AccessKind >> 4) & 7; }
 };
 
+// Version 1 describes argument and return observations; version 2, which a
+// version 1 decoder skips rather than misreads, an access record.
 static constexpr uint8_t DataflowDescriptorVersion = 1;
+static constexpr uint8_t DataflowDescriptorAccessVersion = 2;
 static constexpr size_t DataflowDescriptorSize = 20;
+
+static bool isDataflowDescriptorVersion(uint8_t V) {
+  return V == DataflowDescriptorVersion || V == DataflowDescriptorAccessVersion;
+}
+
+static StringRef getAtomicOrderingName(unsigned Ordering) {
+  switch (Ordering) {
+  case 1:
+    return "unordered";
+  case 2:
+    return "monotonic";
+  case 4:
+    return "acquire";
+  case 5:
+    return "release";
+  case 6:
+    return "acq_rel";
+  case 7:
+    return "seq_cst";
+  default:
+    return "unknown";
+  }
+}
 
 static StringRef getDataflowClassName(uint8_t Class) {
   switch (Class) {
@@ -1034,7 +1086,7 @@ readDataflowDescriptors(const object::ObjectFile &O) {
       for (size_t Off = 0; Valid && Off < Bytes.size(); Off += Stride) {
         uint8_t Version = Bytes[Off + Candidate];
         Valid = Version >= 1 && Version <= 127;
-        Known |= Version == DataflowDescriptorVersion;
+        Known |= isDataflowDescriptorVersion(Version);
       }
       if (Valid && Known) {
         PCSize = Candidate;
@@ -1067,18 +1119,29 @@ readDataflowDescriptors(const object::ObjectFile &O) {
               Section.getAddress() + Off + Rel};
       }
       size_t D = Off + PCSize;
-      if (Bytes[D] != DataflowDescriptorVersion) {
+      if (!isDataflowDescriptorVersion(Bytes[D])) {
         ++Unknown;
         continue;
       }
       DataflowDescriptor Desc;
+      Desc.Version = Bytes[D];
       Desc.Flags = Bytes[D + 1];
       Desc.Class = Bytes[D + 2];
+      Desc.AccessKind = Bytes[D + 3];
       Desc.IRArg = Read(Bytes, D + 4, 2);
       Desc.IRArgCount = Read(Bytes, D + 6, 2);
       Desc.Element = Read(Bytes, D + 8, 2);
+      Desc.AccessSize = Read(Bytes, D + 10, 2);
       Desc.Size = Read(Bytes, D + 12, 4);
       Desc.ElementOffset = Read(Bytes, D + 16, 4);
+      // An access record is version 2 and nothing else is; a descriptor that
+      // says otherwise is not one this decoder understands.
+      if (Desc.isAccess() !=
+          (Desc.Version == DataflowDescriptorAccessVersion)) {
+        errs() << "WARNING: malformed __sancov_dataflow descriptor in "
+               << O.getFileName() << "\n";
+        continue;
+      }
       Result.emplace(PC, Desc);
     }
   }
@@ -1121,7 +1184,8 @@ static void getObjectDataflowPoints(
       Points->emplace(
           Point, DataflowSite{It->second.Flags & DataflowDescriptor::F_Return
                                   ? DataflowKind::Ret
-                                  : DataflowKind::Args,
+                              : It->second.isAccess() ? DataflowKind::Access
+                                                      : DataflowKind::Args,
                               Addr, Sec});
     else if (ArgsAddrs.count(Target))
       Points->emplace(Point, DataflowSite{DataflowKind::Args, Addr, Sec});
@@ -1231,6 +1295,10 @@ static void printDataflowPoints(const std::string &ObjFile, raw_ostream &OS) {
 //   which is how a raw pointee snapshot is cut into members.
 // - Without the source map, at most a positional guess, labelled as one, and
 //   only where no split aggregate or hidden argument makes it ambiguous.
+// - For an access record (-sanitizer-coverage-trace-pointee-access), the
+//   pointer argument it went through, resolved as that argument's
+//   observation would be, and the members of the pointee its bytes overlap.
+//   It is the value of one load or store, never a snapshot of the pointee.
 //
 // Nothing here disassembles the code around a call or reimplements an ABI.
 
@@ -1461,6 +1529,33 @@ struct DataflowSource {
   std::optional<std::string> PointeeType;
   std::vector<Field> PointeeFields;
   uint64_t PointeeBytesRead = 0;
+  // For an access record: the members of the object the pointer points to -
+  // or of the parameter itself, if the pointer is its address - that the
+  // accessed bytes overlap. An access is not the object's state: it is the
+  // value of one load or store, and says nothing of the bytes around it.
+  struct AccessMember {
+    std::string Name;       // Member path within the object; "" for all of it.
+    std::string Expression; // The source expression, e.g. "o->in.x".
+    std::string Type;
+    uint64_t BitOffset; // Of the member, in the object.
+    uint64_t BitSize;
+    uint64_t ValueBit;  // Where the overlap starts in the value.
+    uint64_t MemberBit; // Where it starts in the member.
+    uint64_t Bits;      // How many bits overlap.
+    bool Complete;      // The access holds all of the member.
+  };
+  struct AccessInfo {
+    std::string ObjectType;
+    std::vector<AccessMember> Members;
+    // The bytes lie before the object (container_of), or some of them past
+    // it without an element of an array of such objects to put them in.
+    bool Outside = false;
+    // The bytes are in element Index of an array of such objects (p[Index]).
+    std::optional<uint64_t> Index;
+  };
+  std::optional<AccessInfo> Access;
+  // The DWARF type of the parameter, while the DWARF context is alive.
+  DWARFDie ParamTypeDie;
 };
 
 static StringRef getProvenanceName(DataflowSource::Provenance P) {
@@ -1634,7 +1729,8 @@ static DWARFDie findSubprogram(DWARFDie Scope, object::SectionedAddress Addr) {
 static DataflowSource resolveDataflowSource(DWARFContext *DICtx,
                                             object::SectionedAddress Call,
                                             DataflowKind Kind,
-                                            const DataflowDescriptor *Desc) {
+                                            const DataflowDescriptor *Desc,
+                                            bool OutermostFrame = false) {
   uint64_t CallAddr = Call.Address;
   DataflowSource Src;
   auto Unresolved = [&](StringRef Why) {
@@ -1669,8 +1765,11 @@ static DataflowSource resolveDataflowSource(DWARFContext *DICtx,
   if (!Function)
     return Unresolved("no subprogram for the call site");
   // A trace call inlined after instrumentation reports for the function it was
-  // instrumented in, not for the one it is in now.
-  DWARFDie Subprogram = getInnermostFrame(Function, CallAddr);
+  // instrumented in, not for the one it is in now. An access record has the
+  // location of its access, which may be in a callee inlined before
+  // instrumentation; it reports for the function that holds the call.
+  DWARFDie Subprogram =
+      OutermostFrame ? Function : getInnermostFrame(Function, CallAddr);
   bool Inlined = Subprogram != Function;
 
   std::string Obs = describeObservation(Kind, *Desc);
@@ -1736,6 +1835,7 @@ static DataflowSource resolveDataflowSource(DWARFContext *DICtx,
             Bits += " bits [" + std::to_string(Q.VarBit) + ", " +
                     std::to_string(Q.VarBit + Q.Bits) + ")";
       }
+      Src.ParamTypeDie = T;
       Src.Summary = Obs + " -> " + What + Src.ParamName + "\"" + Bits +
                     " [exact: compiler source map]";
       if (Src.ParamName.empty())
@@ -1776,9 +1876,268 @@ static DataflowSource resolveDataflowSource(DWARFContext *DICtx,
   // it is the parameter or its address: only the type is given - and, for a
   // pointer whose pointee the runtime read, what that pointee is.
   Src.TypeName = getTypeName(getReferencedType(Param));
+  Src.ParamTypeDie = getReferencedType(Param);
   if (Desc->Flags & DataflowDescriptor::F_Pointee)
     if (DWARFDie T = getReferencedType(Param); isPointerLike(stripTypedefs(T)))
       describeType(Src, *Desc, T, Src.ParamName);
+  return Src;
+}
+
+// ---------- Access records ----------
+//
+// An access record is the value of one load or store the function made
+// through a pointer argument: piece `element` of it, `size` bytes at signed
+// byte offset `element offset` from the pointer. The pointer's parameter is
+// found as an argument observation's would be; the DWARF type of what it
+// points to says which members those bytes are, wholly or in part. The bytes
+// around them were not observed, and nothing says what they held.
+
+static std::string describeAccess(const DataflowDescriptor &Desc) {
+  std::string S = "IR argument " + std::to_string(Desc.IRArg) + " ";
+  if (Desc.AccessKind & DataflowDescriptor::AK_Volatile)
+    S += "volatile ";
+  if (Desc.AccessKind & DataflowDescriptor::AK_Atomic)
+    S += std::string("atomic ") +
+         getAtomicOrderingName(Desc.accessOrdering()).str() + " ";
+  S += Desc.AccessKind & DataflowDescriptor::AK_Store ? "store" : "load";
+  S += " of " + std::to_string(Desc.Size) +
+       (Desc.Size == 1 ? " byte" : " bytes") + " at offset " +
+       std::to_string(Desc.accessOffset());
+  if (Desc.Flags & DataflowDescriptor::F_Element)
+    S += " (piece " + std::to_string(Desc.Element) + " of a " +
+         std::to_string(Desc.AccessSize) + "-byte access)";
+  return S;
+}
+
+// The number of elements of array type T, if it has one dimension of known
+// count; 0 if its count is unknown, as a flexible array member's is.
+static std::optional<uint64_t> getArrayCount(DWARFDie T) {
+  std::optional<uint64_t> Count;
+  for (const DWARFDie &Sub : T.children()) {
+    if (Sub.getTag() != dwarf::DW_TAG_subrange_type)
+      continue;
+    if (Count)
+      return std::nullopt; // More than one dimension.
+    if (auto C = dwarf::toUnsigned(Sub.find(dwarf::DW_AT_count)))
+      Count = *C;
+    else if (auto U = dwarf::toUnsigned(Sub.find(dwarf::DW_AT_upper_bound)))
+      Count = *U + 1;
+    else
+      Count = 0;
+  }
+  return Count;
+}
+
+namespace {
+// Collects the members of an object that bits [Lo, Hi) of it overlap.
+struct AccessMemberCollector {
+  int64_t Lo, Hi;
+  std::vector<DataflowSource::AccessMember> &Out;
+
+  void emit(const std::string &Name, DWARFDie T, int64_t Bit, uint64_t Bits) {
+    int64_t OLo = std::max(Bit, Lo);
+    int64_t OHi = std::min(Bit + int64_t(Bits), Hi);
+    if (OLo >= OHi)
+      return;
+    Out.push_back({Name, "", getTypeName(T), uint64_t(Bit), Bits,
+                   uint64_t(OLo - Lo), uint64_t(OLo - Bit), uint64_t(OHi - OLo),
+                   OLo == Bit && OHi == Bit + int64_t(Bits)});
+  }
+
+  // An object of type T at bit Bit, Bits wide if known, named Name.
+  void visit(DWARFDie T, int64_t Bit, std::optional<uint64_t> Bits,
+             const std::string &Name, unsigned Depth) {
+    DWARFDie S = stripTypedefs(T);
+    if (Bits && (Bit >= Hi || Bit + int64_t(*Bits) <= Lo))
+      return;
+    if (Depth > 8 || !S) {
+      if (Bits)
+        emit(Name, T, Bit, *Bits);
+      return;
+    }
+    if (isAggregate(S)) {
+      size_t Before = Out.size();
+      std::string Prefix = Name.empty() ? "" : Name + ".";
+      for (const DWARFDie &M : S.children()) {
+        if (M.getTag() != dwarf::DW_TAG_member &&
+            M.getTag() != dwarf::DW_TAG_inheritance)
+          continue;
+        if (M.find(dwarf::DW_AT_external) || M.find(dwarf::DW_AT_declaration))
+          continue;
+        DWARFDie MT = getReferencedType(M);
+        int64_t MBit = Bit;
+        if (auto DBO = dwarf::toUnsigned(M.find(dwarf::DW_AT_data_bit_offset)))
+          MBit += *DBO;
+        else if (auto DML = dwarf::toUnsigned(
+                     M.find(dwarf::DW_AT_data_member_location)))
+          MBit += 8 * *DML;
+        const char *MName = M.getShortName();
+        std::string MemberName =
+            Prefix + (MName ? MName
+                            : (M.getTag() == dwarf::DW_TAG_inheritance
+                                   ? getTypeName(MT)
+                                   : std::string("<anonymous>")));
+        std::optional<uint64_t> MBits;
+        if (auto BS = dwarf::toUnsigned(M.find(dwarf::DW_AT_bit_size)))
+          MBits = *BS;
+        else if (auto Bytes = getTypeByteSize(MT))
+          MBits = 8 * *Bytes;
+        else if (stripTypedefs(MT).getTag() != dwarf::DW_TAG_array_type)
+          continue;
+        if (MBits && !*MBits)
+          continue;
+        visit(MT, MBit, MBits, MemberName, Depth + 1);
+      }
+      if (Out.size() == Before && Bits)
+        emit(Name, T, Bit, *Bits);
+      return;
+    }
+    if (S.getTag() == dwarf::DW_TAG_array_type) {
+      DWARFDie ET = getReferencedType(S);
+      std::optional<uint64_t> EBytes = getTypeByteSize(ET);
+      std::optional<uint64_t> Count = getArrayCount(S);
+      if (!EBytes || !*EBytes || !Count) {
+        if (Bits)
+          emit(Name, T, Bit, *Bits);
+        return;
+      }
+      int64_t EBits = 8 * *EBytes;
+      int64_t First = std::max<int64_t>(0, (Lo - Bit) / EBits);
+      int64_t Last = (Hi - 1 - Bit) / EBits;
+      if (*Count)
+        Last = std::min<int64_t>(Last, *Count - 1);
+      for (int64_t I = First; I <= Last && I - First < 64; ++I)
+        visit(ET, Bit + I * EBits, uint64_t(EBits),
+              Name + "[" + std::to_string(I) + "]", Depth + 1);
+      return;
+    }
+    if (Bits)
+      emit(Name, T, Bit, *Bits);
+  }
+};
+} // namespace
+
+// The source expression of member Name of what parameter Param points to, or,
+// if Indirect, of the parameter itself, in array element Index of it if any.
+static std::string getAccessExpression(StringRef Param, bool Indirect,
+                                       std::optional<uint64_t> Index,
+                                       StringRef Name) {
+  std::string Base = Param.str();
+  if (Index)
+    Base += "[" + std::to_string(*Index) + "]";
+  else if (!Indirect && (Name.empty() || Name.starts_with("[")))
+    Base = Name.empty() ? "*" + Base : "(*" + Base + ")";
+  if (Name.empty())
+    return Base;
+  if (Name.starts_with("["))
+    return Base + Name.str();
+  return Base + (Indirect || Index ? "." : "->") + Name.str();
+}
+
+static DataflowSource resolveAccessSource(DWARFContext *DICtx,
+                                          object::SectionedAddress Call,
+                                          const DataflowDescriptor &Desc,
+                                          bool LittleEndian) {
+  // The pointer, as an argument observation of it would be resolved.
+  DataflowDescriptor ArgDesc;
+  ArgDesc.Version = DataflowDescriptorVersion;
+  ArgDesc.Flags = Desc.Flags & DataflowDescriptor::F_HiddenArgs;
+  ArgDesc.Class = 2;
+  ArgDesc.IRArg = Desc.IRArg;
+  ArgDesc.IRArgCount = Desc.IRArgCount;
+  DataflowSource Src = resolveDataflowSource(DICtx, Call, DataflowKind::Args,
+                                             &ArgDesc, /*OutermostFrame=*/true);
+  DWARFDie T = Src.ParamTypeDie;
+  Src.ParamTypeDie = {};
+  std::string What = describeAccess(Desc);
+  if (Src.Prov == DataflowSource::Unresolved) {
+    Src.Summary = What + " -> source parameter unresolved (" + Src.Method + ")";
+    return Src;
+  }
+  // What was read behind the pointer at the call is not this record's.
+  Src.Fields.clear();
+  Src.FieldsProvenance.clear();
+  Src.PointeeType.reset();
+  Src.PointeeFields.clear();
+  Src.PointeeBytesRead = 0;
+
+  std::string Param = Src.ParamName.empty()
+                          ? "#" + std::to_string(Src.ParamNumber)
+                          : Src.ParamName;
+  std::string How = Src.Prov == DataflowSource::Exact
+                        ? " [exact: " + Src.Method + "]"
+                        : " [heuristic: " + Src.Method + "]";
+  DWARFDie Object;
+  bool HaveObject = false;
+  if (Src.Indirect) {
+    Object = T;
+    HaveObject = true;
+  } else {
+    DWARFDie Stripped = stripTypedefs(T);
+    DWARFDie PointerType;
+    if (isPointerLike(Stripped))
+      PointerType = Stripped;
+    else if (Src.Pieces.size() == 1 && Src.Pieces[0].ValueBit == 0)
+      PointerType = findPointerMember(T, Src.Pieces[0].VarBit);
+    if (PointerType) {
+      Object = getReferencedType(PointerType);
+      HaveObject = true;
+    }
+  }
+  if (!HaveObject) {
+    Src.Summary = What + " -> through \"" + Param +
+                  "\", which is not a pointer in the debug information" + How;
+    return Src;
+  }
+
+  DataflowSource::AccessInfo Access;
+  Access.ObjectType = getTypeName(Object);
+  int64_t Lo = 8 * Desc.accessOffset();
+  int64_t Hi = Lo + 8 * int64_t(Desc.Size);
+  std::optional<uint64_t> ObjectBytes =
+      Object ? getTypeByteSize(Object) : std::nullopt;
+  int64_t Base = 0;
+  if (Lo < 0) {
+    // Before the object: a member of an enclosing one, which the pointer's
+    // type does not say.
+    Access.Outside = true;
+  } else if (ObjectBytes && *ObjectBytes && Hi > int64_t(8 * *ObjectBytes)) {
+    // Past it: an element of an array of such objects, if the bytes fit one.
+    int64_t ElemBits = 8 * *ObjectBytes;
+    int64_t Index = Lo / ElemBits;
+    if (Index > 0 && Hi <= (Index + 1) * ElemBits) {
+      Access.Index = Index;
+      Base = Index * ElemBits;
+    } else {
+      Access.Outside = true;
+    }
+  }
+  if (Object) {
+    AccessMemberCollector Collector{Lo - Base, Hi - Base, Access.Members};
+    Collector.visit(Object, 0,
+                    ObjectBytes ? std::optional<uint64_t>(8 * *ObjectBytes)
+                                : std::nullopt,
+                    "", 0);
+  }
+  for (DataflowSource::AccessMember &M : Access.Members) {
+    M.Expression =
+        getAccessExpression(Param, Src.Indirect, Access.Index, M.Name);
+    // Which bits of the value are which bits of memory depends on the byte
+    // order; the offsets above are little-endian ones.
+    if (!LittleEndian)
+      M.ValueBit = M.MemberBit = 0;
+  }
+
+  std::string Where;
+  for (const DataflowSource::AccessMember &M : Access.Members)
+    Where += (Where.empty() ? "" : ", ") + M.Expression +
+             (M.Complete ? "" : " (part)");
+  if (Where.empty())
+    Where = Access.Outside ? "outside \"" + Access.ObjectType +
+                                 "\" through \"" + Param + "\""
+                           : "\"" + Param + "\"";
+  Src.Summary = What + " -> " + Where + How;
+  Src.Access = std::move(Access);
   return Src;
 }
 
@@ -1950,9 +2309,13 @@ getDataflowPoints(const std::string &ObjectFile) {
           bool(It->second.Flags & DataflowDescriptor::F_Return) ==
               (Site.Kind == DataflowKind::Ret))
         Point.Desc = It->second;
-      Point.Source =
-          resolveDataflowSource(DICtx.get(), {Site.CallAddr, Site.SectionIndex},
-                                Site.Kind, Point.Desc ? &*Point.Desc : nullptr);
+      Point.Source = Site.Kind == DataflowKind::Access && Point.Desc
+                         ? resolveAccessSource(
+                               DICtx.get(), {Site.CallAddr, Site.SectionIndex},
+                               *Point.Desc, O.isLittleEndian())
+                         : resolveDataflowSource(
+                               DICtx.get(), {Site.CallAddr, Site.SectionIndex},
+                               Site.Kind, Point.Desc ? &*Point.Desc : nullptr);
       Result.push_back(std::move(Point));
     }
   });
@@ -1985,7 +2348,7 @@ static void writeDataflowFields(json::OStream &W, StringRef Name,
 //     {
 //       'pc' : '0x<address>',
 //       'section' : '<name>',   (relocatable objects: the section of 'pc')
-//       'kind' : 'args' | 'ret',
+//       'kind' : 'args' | 'ret' | 'access',
 //       'frames' : [
 //         { 'function' : '<name>', 'file' : '<file>',
 //           'line' : <line>, 'column' : <column> },
@@ -1998,7 +2361,12 @@ static void writeDataflowFields(json::OStream &W, StringRef Name,
 //                   'none',
 //         'size' : <bytes>,
 //         'flags' : [ 'element', 'in_memory_arg', 'sret_object',
-//                     'hidden_args', 'unused', 'pointee' ]
+//                     'hidden_args', 'unused', 'pointee', 'access' ],
+//         'access' : {                 (access records)
+//           'kind' : 'load' | 'store', 'volatile' : true,
+//           'atomic' : '<ordering>', 'offset' : <signed bytes>,
+//           'access_size' : <bytes>, 'piece' : <n>
+//         }
 //       },
 //       'source' : {
 //         'provenance' : 'exact' | 'heuristic' | 'unresolved',
@@ -2012,7 +2380,16 @@ static void writeDataflowFields(json::OStream &W, StringRef Name,
 //         'fields' : [ { 'name', 'type', 'bit_offset', 'bit_size',
 //                        'value_bit_offset', 'complete', 'observed' } ],
 //         'pointee' : { 'type' : '<type>', 'bytes_read' : <bytes>,
-//                       'fields' : [...] }
+//                       'fields' : [...] },
+//         'access' : {                 (access records)
+//           'object_type' : '<what the pointer points to>',
+//           'index' : <n>,      (in element n of an array of such objects)
+//           'outside' : true,   (bytes outside the object, e.g. container_of)
+//           'members' : [ { 'name', 'expression', 'type', 'bit_offset',
+//                           'bit_size', 'value_bit_offset',
+//                           'member_bit_offset', 'overlap_bits',
+//                           'complete' } ]
+//         }
 //       }
 //     },
 //     ...
@@ -2025,6 +2402,13 @@ static void writeDataflowFields(json::OStream &W, StringRef Name,
 // "observed": false if it holds none of it: a member of a pointee beyond the
 // `bytes_read` the runtime read behind the pointer, or all of a pointee it read
 // nothing of.
+//
+// An access record's members are those its bytes overlap, in the object the
+// pointer points to (or the parameter, if the pointer is its address): the
+// overlap is bits [value_bit_offset, + overlap_bits) of the value and bits
+// [member_bit_offset, + overlap_bits) of the member, "complete": false if that
+// is not all of the member. The record is the value of one load or store at
+// the time it executed, not the state of the object.
 static void symbolizeDataflowPoints(const std::vector<std::string> &ObjFiles,
                                     raw_ostream &OS) {
   // Symbolize everything first, so that a failure does not leave half a JSON
@@ -2055,11 +2439,26 @@ static void symbolizeDataflowPoints(const std::vector<std::string> &ObjFiles,
             });
             if (const auto &D = Point.Desc) {
               W.attributeObject("observation", [&] {
-                if (Point.Kind == DataflowKind::Args) {
+                if (Point.Kind != DataflowKind::Ret) {
                   W.attribute("ir_arg", D->IRArg);
                   W.attribute("ir_args", D->IRArgCount);
                 }
-                if (D->Flags & DataflowDescriptor::F_Element) {
+                if (D->isAccess()) {
+                  W.attributeObject("access", [&] {
+                    W.attribute("kind",
+                                D->AccessKind & DataflowDescriptor::AK_Store
+                                    ? "store"
+                                    : "load");
+                    if (D->AccessKind & DataflowDescriptor::AK_Volatile)
+                      W.attribute("volatile", true);
+                    if (D->AccessKind & DataflowDescriptor::AK_Atomic)
+                      W.attribute("atomic",
+                                  getAtomicOrderingName(D->accessOrdering()));
+                    W.attribute("offset", D->accessOffset());
+                    W.attribute("access_size", D->AccessSize);
+                    W.attribute("piece", D->Element);
+                  });
+                } else if (D->Flags & DataflowDescriptor::F_Element) {
                   W.attribute("element", D->Element);
                   W.attribute("element_offset", D->ElementOffset);
                 }
@@ -2078,6 +2477,8 @@ static void symbolizeDataflowPoints(const std::vector<std::string> &ObjFiles,
                     W.value("unused");
                   if (D->Flags & DataflowDescriptor::F_Pointee)
                     W.value("pointee");
+                  if (D->isAccess())
+                    W.value("access");
                 });
               });
             }
@@ -2088,7 +2489,7 @@ static void symbolizeDataflowPoints(const std::vector<std::string> &ObjFiles,
               W.attribute("summary", Src.Summary);
               if (Src.Prov == DataflowSource::Unresolved)
                 return;
-              if (Point.Kind == DataflowKind::Args)
+              if (Point.Kind != DataflowKind::Ret)
                 W.attributeObject("parameter", [&] {
                   W.attribute("name", Src.ParamName);
                   if (Src.ParamNumber)
@@ -2099,7 +2500,7 @@ static void symbolizeDataflowPoints(const std::vector<std::string> &ObjFiles,
               W.attribute("type", Src.TypeName);
               if (Src.Indirect)
                 W.attribute("indirect", true);
-              if (Point.Kind == DataflowKind::Args && !Src.Indirect &&
+              if (Point.Kind != DataflowKind::Ret && !Src.Indirect &&
                   !Src.Pieces.empty())
                 W.attributeArray("pieces", [&] {
                   for (const DataflowMapPiece &P : Src.Pieces)
@@ -2119,6 +2520,32 @@ static void symbolizeDataflowPoints(const std::vector<std::string> &ObjFiles,
                   W.attribute("type", *Src.PointeeType);
                   W.attribute("bytes_read", int64_t(Src.PointeeBytesRead));
                   writeDataflowFields(W, "fields", Src.PointeeFields);
+                });
+              }
+              if (const auto &A = Src.Access) {
+                W.attributeObject("access", [&] {
+                  W.attribute("object_type", A->ObjectType);
+                  if (A->Index)
+                    W.attribute("index", int64_t(*A->Index));
+                  if (A->Outside)
+                    W.attribute("outside", true);
+                  W.attributeArray("members", [&] {
+                    for (const DataflowSource::AccessMember &M : A->Members)
+                      W.object([&] {
+                        W.attribute("name", M.Name);
+                        W.attribute("expression", M.Expression);
+                        W.attribute("type", M.Type);
+                        W.attribute("bit_offset", int64_t(M.BitOffset));
+                        W.attribute("bit_size", int64_t(M.BitSize));
+                        W.attribute("value_bit_offset", int64_t(M.ValueBit));
+                        if (M.MemberBit)
+                          W.attribute("member_bit_offset",
+                                      int64_t(M.MemberBit));
+                        W.attribute("overlap_bits", int64_t(M.Bits));
+                        if (!M.Complete)
+                          W.attribute("complete", false);
+                      });
+                  });
                 });
               }
             });
