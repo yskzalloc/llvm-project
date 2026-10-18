@@ -416,6 +416,84 @@ bits.
 The compiler never creates memory to report a value from, so no stack slot
 escapes and no frame is realigned on the instrumentation's account.
 
+### Pointee accesses
+
+A pointee snapshot needs an IR contract that the bytes may be read at the
+call; a plain C pointer has none, and the instrumentation does not infer one.
+With `-mllvm -sanitizer-coverage-trace-pointee-access`, `trace-args` instead
+reports what the function itself loads and stores through its pointer
+arguments:
+
+* after each **load** whose address is a pointer argument plus a constant byte
+  offset, the value the load returned;
+* after each such **store**, the value the store wrote.
+
+The two mechanisms are different observations, and the descriptor tells them
+apart:
+
+| | pointee snapshot (`DF_Pointee`) | access record (`DF_Access`) |
+|---|---|---|
+| when | at the call or return trace point | when the access executes |
+| what | the first bytes of the pointee, read by the runtime | the value of one load, or the value one store wrote |
+| needs | a `dereferenceable(N)` or `dereferenceable_or_null(N)` attribute | a load or store of the program's |
+| memory read by the instrumentation | the snapshot | none |
+
+An access record is the call
+
+```c++
+__sanitizer_cov_trace_args(0x80000000 | kind << 16 | ir_arg, size, val,
+                           /*offsets=*/nullptr, /*num_fields=*/0);
+```
+
+with `kind` bit 0 set for a store, bit 1 for a volatile access and bit 2 for
+an atomic one, so that a runtime can tell it from an argument value without
+the descriptor; `val` is the value, as for an argument value, and `size` its
+bytes. A value wider than 8 bytes is reported in 8-byte pieces in memory order,
+one call each; a first-class aggregate element by element. The value is the
+SSA value the original instruction produced or consumed: the instrumentation
+adds no load, and does not move, split, widen, duplicate or reorder the
+access. A record is made exactly when its access executes - in a conditional
+block only if the block runs - and every execution of every access makes one.
+
+What an access record is not:
+
+* not the state of the pointee: only the bytes the function accessed are
+  seen, and members it did not access are not represented;
+* not the value at the call: the access may follow other code, including
+  calls that changed the pointee, and the record says when it was made by
+  where it is in the record stream;
+* for a store, not a claim that the value was still in memory afterwards.
+
+One member may have many records, one per access, in execution order.
+
+The address must be the argument plus a constant: constant-offset GEPs, pointer
+bitcasts, and PHIs and selects whose incoming values are all the same argument
+at the same offset are followed; a variable index, a pointer loaded from
+memory, `inttoptr`, `addrspacecast` or a call result is not. The offset is
+signed - a `container_of` access lies below the pointer - and fits 32 bits.
+Arguments in address spaces other than 0, `byval`, `byref`, `inalloca`,
+`preallocated` and `sret` arguments (whose objects are reported whole already)
+and `swifterror` slots are not followed, nor are accesses marked `!nosanitize`
+by another instrumentation, nor accesses wider than 64 bytes.
+
+Volatile accesses are reported with
+`-sanitizer-coverage-trace-pointee-access-volatile`, and atomic loads and
+stores with `-sanitizer-coverage-trace-pointee-access-atomic`; both off by
+default. Their records are made of the original instruction's value too, so
+neither the access nor its ordering changes. Not reported, and never
+recovered by a read of their memory: `atomicrmw` and `cmpxchg` (their old value
+is the result of a read-modify-write, and the stored value of a `cmpxchg`
+depends on whether it succeeded), `memcpy`, `memset` and other memory
+intrinsics, masked and gather/scatter intrinsics, and inline assembly,
+including the inline-assembly atomics and MMIO accessors of the Linux kernel.
+
+Which accesses are reported is decided by the IR alone, identically with and
+without `-g`; a record takes the line and column of its access as its
+location. The records add calls, not memory accesses; they can keep the code
+generator from combining adjacent accesses into one, or folding a load into
+the instruction that uses it, which changes the machine code but not what the
+program reads or writes.
+
 ### IR arguments, not source parameters
 
 `arg_idx` is the position of the argument in the IR function's parameter list.
@@ -475,7 +553,8 @@ only the first and the third are recorded:
   (`"complete": false`), and one beyond it was not read (`"observed": false`).
 
 What carries the contract is up to the front end (see above). An ordinary C
-`T *` argument normally does not, and is a pointer value only; a Rust `&T` or
+`T *` argument normally does not, and is a pointer value only (unless access
+records are enabled, below); a Rust `&T` or
 `&mut T` usually does; a Rust raw pointer, `*const T` or `*mut T`, does not,
 nor does a C pointer unless declared `T p[static N]`. Nothing is inferred to
 stand in for a missing contract - not from later accesses, the size of an
@@ -490,9 +569,11 @@ objects, 318 (42%) do. These are the shares of pointer arguments with at
 least one recorded pointee byte, not of arguments, structs or return values
 reconstructed in full.
 
-Recording, for a pointer without a contract, the values the function itself
-loads and stores through it, when it does, is possible future work, and not
-part of this implementation.
+For a pointer without a contract, `-mllvm
+-sanitizer-coverage-trace-pointee-access` records instead the values the
+function itself loads and stores through it, when it does: see "Pointee
+accesses" below. That is not a snapshot either: it covers the bytes the
+function accessed, at the time it accessed them.
 
 Mapping an observation to a source parameter, or to a struct field, is the
 job of a consumer that has the binary's debug information - see "Source-level
@@ -517,16 +598,21 @@ code models), followed by, in the target's byte order:
 
 | Field | Type | Meaning |
 |---|---|---|
-| version | `u8` | 1 |
-| flags | `u8` | 1 return, 2 element of a first-class aggregate, 4 in-memory argument (`byval`, `byref`, `inalloca`, `preallocated`), 8 `sret` object, 16 the function has an `sret` or Swift error argument, 32 the function does not use the argument, 64 a pointer reported with a snapshot of the bytes it points to |
+| version | `u8` | 1; 2 for an access record |
+| flags | `u8` | 1 return, 2 element of a first-class aggregate (of an access: one of several pieces), 4 in-memory argument (`byval`, `byref`, `inalloca`, `preallocated`), 8 `sret` object, 16 the function has an `sret` or Swift error argument, 32 the function does not use the argument, 64 a pointer reported with a snapshot of the bytes it points to, 128 an access record |
 | class | `u8` | 0 none, 1 integer, 2 pointer, 3 floating point, 4 vector, 5 object in memory |
-| reserved | `u8` | 0 |
-| IR argument | `u16` | `arg_idx`; `0xffff` for a return |
+| access kind | `u8` | of an access record: 1 store (else load), 2 volatile, 4 atomic, and the `llvm::AtomicOrdering` in bits 4-6; else 0 |
+| IR argument | `u16` | `arg_idx`; `0xffff` for a return; of an access record, the pointer argument |
 | IR arguments | `u16` | number of IR arguments of the function |
-| element | `u16` | element of a first-class aggregate, else 0 |
-| reserved | `u16` | 0 |
+| element | `u16` | element of a first-class aggregate, or piece of an access, else 0 |
+| access size | `u16` | of an access record, the bytes of the whole access; else 0 |
 | size | `u32` | the callback's `size`: for a pointee snapshot, the bytes read |
-| element offset | `u32` | byte offset of the element in the aggregate's IR layout |
+| element offset | `u32` | byte offset of the element in the aggregate's IR layout; of an access record, the signed byte offset of the piece from the pointer |
+
+Access records are version 2 so that a decoder knowing only version 1 skips
+them rather than taking them for argument values. With
+`-sanitizer-coverage-trace-pointee-access` off, every descriptor is version 1
+and byte-identical to one built without the option.
 
 Every entry has the same size whatever its version, which is 1 to 127, so a
 decoder skips an entry of a version it does not know and decodes the others.
@@ -609,6 +695,32 @@ them, or of a pointee that was not read, `"observed": false`:
                         "bit_size": 64 } ] } }
 ```
 
+An access record (`"kind": "access"`) resolves its pointer argument as an
+argument observation would, and lists the members of the pointee its bytes
+overlap - or of the parameter, if the pointer is the parameter's address -
+with where in `val` the overlap is, `"complete": false` for part of a member,
+and a source expression for each:
+
+```console
+      "kind": "access",
+      "observation": { "ir_arg": 0, "ir_args": 1,
+                       "access": { "kind": "load", "offset": 12,
+                                   "access_size": 2, "piece": 0 },
+                       "class": "integer", "size": 2, "flags": [ "access" ] },
+      "source": { ...
+        "summary": "IR argument 0 load of 2 bytes at offset 12 -> o->in.y [exact: compiler source map]",
+        "access": { "object_type": "outer",
+          "members": [ { "name": "in.y", "expression": "o->in.y",
+                         "type": "short", "bit_offset": 96, "bit_size": 16,
+                         "value_bit_offset": 0, "overlap_bits": 16 } ] } }
+```
+
+Bytes past the pointee that fit one element of an array of it are `index`ed
+(`p[1].x`); bytes before it, as a `container_of` access has, are `"outside":
+true`. An access in a callee inlined before instrumentation is reported for
+the function that holds it. Without debug information the descriptor alone
+says which argument, where, how wide, and whether it was a load or a store.
+
 A pointer that is one piece of a parameter, such as the vtable of a Rust trait
 object, gets the pointee of the member it is. A type DWARF gives no members for
 - Swift describes its types' layout in runtime metadata instead - is one opaque
@@ -660,7 +772,8 @@ a program compiled with `trace-args`/`trace-ret` links without a runtime that
 consumes the values; a strong definition overrides the default.
 
 libFuzzer provides one and folds every reported value into the value-profile
-map, enabled with `-use_value_profile=1`. A value bound to its site - the `pc`,
+map, enabled with `-use_value_profile=1`; an access record's value is folded
+like an argument's, under its own `pc`. A value bound to its site - the `pc`,
 the argument or return position, and the element within an object - that has
 never been seen there before becomes a new value-profile feature, so an input
 that reaches a function with a new argument value counts as new coverage and is
