@@ -139,6 +139,11 @@ __sanitizer_cov_trace_switch();
 // Neither callback is passed the function it speaks for. A runtime that needs
 // it takes its own return address, less one so that the address lies within the
 // call, which identifies the observation.
+// With -sanitizer-coverage-trace-pointee-access, a trace-args call whose
+// arg_idx has bit 31 set is an access record: `val` is the value a load
+// through IR argument arg_idx & 0xffff returned, or a store through it wrote
+// (arg_idx bit 16), `size` bytes of it, made after the access; bit 17 marks a
+// volatile and bit 18 an atomic access. offsets is null: nothing is to be read.
 SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void
 __sanitizer_cov_trace_args();
 SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void

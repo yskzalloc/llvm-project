@@ -28,7 +28,18 @@ pointer the members of what it points to, as ->{<member>=<value>...}.
 
 A record matches the call site at its return address minus one, which is how
 sancov defines a trace-args/trace-ret call site on every target.
+
+A trace-args record whose idx has bit 31 set is an access record
+(-sanitizer-coverage-trace-pointee-access): the value of a load or store
+through IR argument idx & 0xffff, its kind in bits 16-23. It is printed as
+
+  ACCESS arg=<n> <load|store> size=<n> val=<v> in <frame>...
+
+and with --source as the members of the pointee the accessed bytes overlap,
+<expression>=<value>, "(part)" for a member the access holds only part of.
 """
+
+ACCESS_FLAG = 1 << 31
 
 import json
 import sys
@@ -39,6 +50,19 @@ def describe_source(point, rest):
     prov = source.get("provenance", "unresolved")
     if prov == "unresolved":
         return f" -> unresolved ({source.get('method', '?')})"
+    if point["kind"] == "access":
+        opts = dict(f.split("=", 1) for f in rest.split() if "=" in f)
+        val = int(opts.get("val", "0"), 16)
+        decoded = []
+        for m in source.get("access", {}).get("members", []):
+            bits = m["overlap_bits"]
+            v = (val >> m["value_bit_offset"]) & ((1 << bits) - 1)
+            part = "" if m.get("complete", True) else "(part)"
+            decoded.append(f"{m['expression']}{part}=0x{v:x}")
+        if not decoded:
+            decoded.append("outside" if source.get("access", {}).get("outside")
+                           else "no member")
+        return f" -> {prov} " + ", ".join(decoded)
     if point["kind"] == "args":
         param = source.get("parameter", {})
         what = ("&" if source.get("indirect") else "") + param.get("name", "?")
@@ -122,6 +146,15 @@ def main():
                 continue
             kind, ret_addr = fields[0], int(fields[1], 16)
             rest = fields[2].strip() if len(fields) > 2 else ""
+            opts = dict(f.split("=", 1) for f in rest.split() if "=" in f)
+            if kind == "ARGS" and int(opts.get("idx", "0")) & ACCESS_FLAG:
+                idx = int(opts["idx"])
+                kind = "ACCESS"
+                what = "store" if (idx >> 16) & 1 else "load"
+                rest = " ".join(
+                    [f"arg={idx & 0xFFFF} {what}"]
+                    + [f for f in rest.split() if not f.startswith("idx=")]
+                )
             point = points.get(ret_addr - 1)
             if point is None:
                 print(f"{kind} {rest} UNMATCHED at 0x{ret_addr:x}")
