@@ -35,6 +35,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/Support/MathExtras.h"
@@ -241,6 +242,9 @@ private:
     unsigned Element = 0;
     uint64_t ElementOffset = 0;
     uint64_t Size = 0;
+    /// For an access record: AK_* below, and the size of the whole access.
+    uint8_t AccessKind = 0;
+    uint64_t AccessSize = 0;
   };
   /// Create one trace-args/trace-ret call, which is never a tail call, and
   /// attach the descriptor of \p Obs to it.
@@ -264,10 +268,30 @@ private:
   uint64_t getPointeeBytes(Value *Ptr, uint64_t Dereferenceable) const;
   /// The descriptor fields every observation of \p F shares.
   static Observation getFunctionObservation(Function &F);
+  /// A load or store that trace-pointee-access reports: it accesses memory at
+  /// constant byte offset Offset from pointer argument Arg.
+  struct PointeeAccess {
+    Instruction *I;
+    Argument *Arg;
+    int64_t Offset;
+  };
+  /// The access \p I is, if it is one trace-pointee-access reports.
+  std::optional<PointeeAccess> getPointeeAccess(Instruction &I) const;
+  /// Report the value each access in \p Accesses loads or stores.
+  void InjectTraceForPointeeAccesses(Function &F,
+                                     ArrayRef<PointeeAccess> Accesses);
+  /// Emit the access records of value \p V, accessed at byte \p Offset from
+  /// the pointer argument of \p Obs: one per 8-byte piece of it.
+  void traceAccessValue(IRBuilderBase &IRB, Value *V, int64_t Offset,
+                        Observation &Obs);
   /// Whether trace calls get an observation descriptor.
   bool EmitObservationDescriptors = false;
   /// The most bytes a trace call reads behind a dereferenceable pointer.
   uint64_t TracePointeeBytes = 0;
+  /// Which loads and stores through pointer arguments are reported.
+  bool TracePointeeAccess = false;
+  bool TracePointeeAccessVolatile = false;
+  bool TracePointeeAccessAtomic = false;
 
   const InstrumentationOptions &Opts;
   Module &M;
@@ -438,6 +462,14 @@ bool ModuleSanitizerCoverage::instrumentModule() {
       TargetTriple.isOSBinFormatELF() &&
       (TargetTriple.isX86() || TargetTriple.isAArch64());
   TracePointeeBytes = Opts.sanitizer_coverage_trace_pointee_bytes;
+  // Access records go through the trace-args callback.
+  TracePointeeAccess =
+      Options.TraceArgs && Opts.sanitizer_coverage_trace_pointee_access;
+  TracePointeeAccessVolatile =
+      TracePointeeAccess &&
+      Opts.sanitizer_coverage_trace_pointee_access_volatile;
+  TracePointeeAccessAtomic =
+      TracePointeeAccess && Opts.sanitizer_coverage_trace_pointee_access_atomic;
   FunctionGuardArray = nullptr;
   Function8bitCounterArray = nullptr;
   FunctionBoolArray = nullptr;
@@ -725,6 +757,7 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
   SmallVector<GetElementPtrInst *, 8> GepTraceTargets;
   SmallVector<LoadInst *, 8> Loads;
   SmallVector<StoreInst *, 8> Stores;
+  SmallVector<PointeeAccess, 8> PointeeAccesses;
 
   const DominatorTree &DT = DTCallback(F);
   const PostDominatorTree &PDT = PDTCallback(F);
@@ -734,6 +767,11 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
     if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
       BlocksToInstrument.push_back(&BB);
     for (auto &Inst : BB) {
+      // The accesses are chosen before anything is instrumented, from the
+      // program's own instructions only.
+      if (TracePointeeAccess)
+        if (std::optional<PointeeAccess> Access = getPointeeAccess(Inst))
+          PointeeAccesses.push_back(*Access);
       if (Options.IndirectCalls) {
         CallBase *CB = dyn_cast<CallBase>(&Inst);
         if (CB && CB->isIndirectCall())
@@ -784,6 +822,9 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
 
   if (Options.TraceArgs)
     InjectTraceForArgs(F);
+
+  if (TracePointeeAccess)
+    InjectTraceForPointeeAccesses(F, PointeeAccesses);
 
   if (Options.TraceRet)
     InjectTraceForRet(F);
@@ -1412,14 +1453,14 @@ ModuleSanitizerCoverage::getObjectOffsets(Type *Ty) {
 // instruction (32 bits, or 64 for the medium and large code models), followed
 // by
 //
-//   u8  version         1
+//   u8  version         1, or 2 for an access record (DF_Access)
 //   u8  flags           DF_* below
 //   u8  value class     DC_* below
-//   u8  reserved        0
+//   u8  access kind     AK_* below for an access record, else 0
 //   u16 IR argument     position in the IR parameter list; 0xffff for returns
 //   u16 IR arguments    number of IR arguments of the function
 //   u16 element         element of a first-class aggregate, else 0
-//   u16 reserved        0
+//   u16 access size     bytes of the whole access for an access record, else 0
 //   u32 size            the callback's `size`
 //   u32 element offset  byte offset of the element in the aggregate's layout
 //
@@ -1443,6 +1484,23 @@ ModuleSanitizerCoverage::getObjectOffsets(Type *Ty) {
 // memory is DC_Object. Both arrive at the runtime as an address and a table of
 // what to read, so only the descriptor says whether the source-level value
 // observed is the object or a pointer to it.
+//
+// An access record (DF_Access, see "Pointee accesses" below) is version 2: a
+// decoder that knows only version 1 skips it rather than mistake it for an
+// argument value. For it,
+//
+//   IR argument     is the pointer argument the access goes through;
+//   element         numbers the 8-byte pieces of an access wider than that,
+//                   from 0, with DF_Element set if there is more than one;
+//   element offset  is the signed byte offset of the piece from the pointer,
+//                   as a 32-bit two's complement value;
+//   access size     is the store size of the whole loaded or stored value;
+//   size            is the bytes of it this piece holds;
+//   value class     is the class of the piece's value.
+//
+// No observation is both DF_Pointee and DF_Access: a snapshot is read by the
+// runtime at the trace point, an access value is one the program loaded or
+// stored.
 enum : uint8_t {
   DF_Return = 1 << 0,      // A trace-ret observation.
   DF_Element = 1 << 1,     // An element of a first-class aggregate.
@@ -1451,6 +1509,7 @@ enum : uint8_t {
   DF_HiddenArgs = 1 << 4,  // The function has an sret or swifterror argument.
   DF_Unused = 1 << 5,      // The function does not use the argument.
   DF_Pointee = 1 << 6,     // A pointer, with the bytes it points to.
+  DF_Access = 1 << 7,      // A value loaded or stored through a pointer.
 };
 enum : uint8_t {
   DC_None = 0, // Nothing reported: size is 0.
@@ -1460,8 +1519,25 @@ enum : uint8_t {
   DC_Vector = 4,
   DC_Object = 5, // `val` is the address of an object, `offsets` its layout.
 };
+// The access kind of an access record: bits 0-2 below, and in bits 4-6 the
+// llvm::AtomicOrdering of an atomic access.
+enum : uint8_t {
+  AK_Store = 1 << 0,    // The value stored; otherwise the value loaded.
+  AK_Volatile = 1 << 1, // A volatile access.
+  AK_Atomic = 1 << 2,   // An atomic access.
+};
+static constexpr unsigned AccessKindOrderingShift = 4;
 static constexpr unsigned DescriptorVersion = 1;
+static constexpr unsigned DescriptorAccessVersion = 2;
 static constexpr unsigned DescriptorReturnArg = 0xffff;
+// The `arg_idx` of the trace-args call of an access record: the IR argument in
+// bits 0-15, the access kind in bits 16-23, and bit 31 set. A runtime can tell
+// such a record from an argument value without the descriptor.
+static constexpr uint32_t AccessArgIdxFlag = 1u << 31;
+static constexpr unsigned AccessArgIdxKindShift = 16;
+// The most 8-byte pieces one access is reported in; a wider access, or a
+// first-class aggregate of more scalars, is not reported.
+static constexpr unsigned MaxAccessPieces = 8;
 
 /// The descriptor class of a value of type \p Ty.
 static uint8_t getValueClass(Type *Ty) {
@@ -1533,6 +1609,11 @@ void ModuleSanitizerCoverage::emitTraceCall(IRBuilderBase &IRB,
   // return address instead, and a trace-ret call of a void function is in tail
   // position.
   CI->setTailCallKind(CallInst::TCK_NoTail);
+  // The records of two accesses differ in their descriptors only, which code
+  // generation does not compare: tail merging would otherwise give the
+  // stores of two branches one shared call, and one PC, for both.
+  if (Obs.Flags & DF_Access)
+    CI->addFnAttr(Attribute::NoMerge);
   if (!EmitObservationDescriptors)
     return;
 
@@ -1544,13 +1625,16 @@ void ModuleSanitizerCoverage::emitTraceCall(IRBuilderBase &IRB,
     return ConstantInt::get(Int32Ty, std::min<uint64_t>(V, 0xffffffff));
   };
   MDBuilder MDB(*C);
+  bool Access = Obs.Flags & DF_Access;
   CI->setMetadata(
       LLVMContext::MD_pcsections,
       MDB.createPCSections(
           {{SanCovDataflowSectionName,
-            {U8(DescriptorVersion), U8(Obs.Flags), U8(Obs.Class), U8(0),
+            {U8(Access ? DescriptorAccessVersion : DescriptorVersion),
+             U8(Obs.Flags), U8(Obs.Class), U8(Access ? Obs.AccessKind : 0),
              U16(Obs.Flags & DF_Return ? DescriptorReturnArg : Obs.IRArg),
-             U16(Obs.IRArgCount), U16(Obs.Element), U16(0), U32(Obs.Size),
+             U16(Obs.IRArgCount), U16(Obs.Element),
+             U16(Access ? Obs.AccessSize : 0), U32(Obs.Size),
              U32(Obs.ElementOffset)}}}));
 }
 
@@ -2346,5 +2430,321 @@ void ModuleSanitizerCoverage::InjectTraceForRet(Function &F) {
       // void
       traceObject(IRB, SanCovTraceRetFunc, {}, nullptr, nullptr, Obs);
     }
+  }
+}
+
+// Pointee accesses
+// ----------------
+//
+// With -sanitizer-coverage-trace-pointee-access, trace-args also reports what
+// the function itself loads and stores through its pointer arguments: after
+// each such load, the value it loaded, and after each such store, the value it
+// stored. The record is made of the SSA value the original instruction
+// produced or consumed. The pass adds no memory access for it, and moves,
+// splits, widens or duplicates none: the program reads what it read before,
+// once, where it read it, and the record exists exactly when the instruction
+// executed. What a record does not say: what the rest of the pointee held, what
+// the pointee held at the call, or that a stored value was still in memory
+// later.
+//
+// This complements the pointee snapshots of dereferenceable pointers above,
+// which the runtime reads at the trace point because an IR attribute says it
+// may. A pointer with no such attribute is never read by the instrumentation;
+// an access record is the only way its pointee is seen, and only as far as the
+// function's own accesses go.
+//
+// An access is reported when all of these hold:
+//
+// - It is a load or a store, not volatile unless
+//   -sanitizer-coverage-trace-pointee-access-volatile and not atomic unless
+//   -sanitizer-coverage-trace-pointee-access-atomic say so. Its value is the
+//   one the instruction already has, so neither its ordering nor its width
+//   changes. atomicrmw, cmpxchg, memcpy, memset and other memory intrinsics,
+//   masked and gather/scatter intrinsics, and inline assembly are not
+//   reported: their values are either not an SSA value of the access or not a
+//   plain load or store of it, and nothing is read to recover one.
+// - It is not marked !nosanitize, which the code other instrumentation passes
+//   emit is.
+// - Its address is a pointer argument of the function, in address space 0 and
+//   not one the ABI passes a copy of the parameter or a return buffer in
+//   (byval, byref, inalloca, preallocated, sret: the object itself is reported
+//   already) or a swifterror slot, plus a constant byte offset. Only these
+//   relate the address to the argument: constant-offset GEPs, pointer
+//   bitcasts, and PHIs and selects all of whose incoming values are the same
+//   argument at the same offset. A variable index, an addrspacecast, a
+//   pointer loaded from memory, inttoptr, a call result or anything else is
+//   not followed. The offset may be negative and must fit 32 bits.
+// - Its value has a fixed size and is an integer, floating-point, pointer or
+//   fixed vector value, or a first-class aggregate of them, in at most
+//   MaxAccessPieces 8-byte pieces.
+//
+// Neither the choice nor the record depends on debug information: the record
+// takes the location of the access, if it has one, and nothing else.
+//
+// The record is a trace-args call with `arg_idx` marking it (see
+// AccessArgIdxFlag), `size` the bytes of the piece, `val` the piece's value,
+// and no offsets table, so a runtime never dereferences anything for it. A
+// value wider than 8 bytes is reported in 8-byte pieces in memory order, one
+// call each; a first-class aggregate element by element.
+
+namespace {
+struct ArgOffset {
+  Argument *Arg;
+  int64_t Offset;
+  bool operator==(const ArgOffset &Other) const {
+    return Arg == Other.Arg && Offset == Other.Offset;
+  }
+};
+} // namespace
+
+/// The pointer argument \p V is a constant byte offset from, if only constant
+/// offsets, pointer bitcasts, and PHIs and selects agreeing on the argument and
+/// the offset lead to it. \p Budget bounds the walk through PHIs and selects.
+static std::optional<ArgOffset>
+getArgumentOffset(const DataLayout &DL, Value *V,
+                  SmallPtrSetImpl<Value *> &Visiting, unsigned &Budget) {
+  if (!Budget--)
+    return std::nullopt;
+  if (auto *A = dyn_cast<Argument>(V))
+    return ArgOffset{A, 0};
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+    if (!GEP->accumulateConstantOffset(DL, Offset) ||
+        Offset.getSignificantBits() > 64)
+      return std::nullopt;
+    std::optional<ArgOffset> Base =
+        getArgumentOffset(DL, GEP->getPointerOperand(), Visiting, Budget);
+    int64_t Sum;
+    if (!Base || AddOverflow(Base->Offset, Offset.getSExtValue(), Sum))
+      return std::nullopt;
+    return ArgOffset{Base->Arg, Sum};
+  }
+  if (auto *BC = dyn_cast<BitCastOperator>(V))
+    return BC->getSrcTy()->isPointerTy()
+               ? getArgumentOffset(DL, BC->getOperand(0), Visiting, Budget)
+               : std::nullopt;
+
+  SmallVector<Value *, 4> Incoming;
+  if (auto *PN = dyn_cast<PHINode>(V))
+    Incoming.append(PN->incoming_values().begin(), PN->incoming_values().end());
+  else if (auto *SI = dyn_cast<SelectInst>(V))
+    Incoming = {SI->getTrueValue(), SI->getFalseValue()};
+  else
+    return std::nullopt;
+  // A cycle through other PHIs may add an offset on every turn: give up on
+  // one, but a PHI taking itself on a back edge is still the same value.
+  if (!Visiting.insert(V).second)
+    return std::nullopt;
+  std::optional<ArgOffset> Result;
+  bool Agree = true;
+  for (Value *In : Incoming) {
+    if (In == V)
+      continue;
+    std::optional<ArgOffset> Op = getArgumentOffset(DL, In, Visiting, Budget);
+    if (!Op || (Result && !(*Result == *Op))) {
+      Agree = false;
+      break;
+    }
+    Result = Op;
+  }
+  Visiting.erase(V);
+  return Agree ? Result : std::nullopt;
+}
+
+/// The number of 8-byte pieces a value of type \p Ty is reported in, or more
+/// than MaxAccessPieces if it is not reported.
+static unsigned getAccessPieces(const DataLayout &DL, Type *Ty) {
+  constexpr unsigned TooMany = MaxAccessPieces + 1;
+  if (auto *STy = dyn_cast<StructType>(Ty)) {
+    unsigned Pieces = 0;
+    for (Type *ElTy : STy->elements())
+      if ((Pieces += getAccessPieces(DL, ElTy)) > MaxAccessPieces)
+        return TooMany;
+    return Pieces;
+  }
+  if (auto *ATy = dyn_cast<ArrayType>(Ty)) {
+    if (ATy->getNumElements() > MaxAccessPieces)
+      return TooMany;
+    unsigned Pieces =
+        ATy->getNumElements() * getAccessPieces(DL, ATy->getElementType());
+    return std::min(Pieces, TooMany);
+  }
+  if (!Ty->isIntegerTy() && !Ty->isPointerTy() && !Ty->isFloatingPointTy() &&
+      !isa<FixedVectorType>(Ty))
+    return TooMany;
+  TypeSize Bytes = DL.getTypeStoreSize(Ty);
+  if (Bytes.isScalable())
+    return TooMany;
+  // Cutting a wider value into memory-order pieces needs to know which bits
+  // land in which bytes; on a big-endian target only when the value fills its
+  // store size.
+  if (Bytes.getFixedValue() > sizeof(uint64_t) && DL.isBigEndian() &&
+      DL.getTypeSizeInBits(Ty) != 8 * Bytes.getFixedValue())
+    return TooMany;
+  return std::min<uint64_t>(divideCeil(Bytes.getFixedValue(), 8), TooMany);
+}
+
+std::optional<ModuleSanitizerCoverage::PointeeAccess>
+ModuleSanitizerCoverage::getPointeeAccess(Instruction &I) const {
+  Value *Ptr;
+  Type *Ty;
+  bool Volatile, Atomic;
+  if (auto *LI = dyn_cast<LoadInst>(&I)) {
+    Ptr = LI->getPointerOperand();
+    Ty = LI->getType();
+    Volatile = LI->isVolatile();
+    Atomic = LI->isAtomic();
+  } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+    Ptr = SI->getPointerOperand();
+    Ty = SI->getValueOperand()->getType();
+    Volatile = SI->isVolatile();
+    Atomic = SI->isAtomic();
+  } else {
+    return std::nullopt;
+  }
+  if ((Volatile && !TracePointeeAccessVolatile) ||
+      (Atomic && !TracePointeeAccessAtomic) ||
+      I.hasMetadata(LLVMContext::MD_nosanitize) ||
+      Ptr->getType()->getPointerAddressSpace() != 0 || !Ty->isSized())
+    return std::nullopt;
+  TypeSize Bytes = DL->getTypeStoreSize(Ty);
+  if (Bytes.isScalable() || !Bytes.getFixedValue())
+    return std::nullopt;
+  unsigned Pieces = getAccessPieces(*DL, Ty);
+  if (!Pieces || Pieces > MaxAccessPieces)
+    return std::nullopt;
+
+  SmallPtrSet<Value *, 8> Visiting;
+  unsigned Budget = 64;
+  std::optional<ArgOffset> Base = getArgumentOffset(*DL, Ptr, Visiting, Budget);
+  if (!Base)
+    return std::nullopt;
+  Argument *Arg = Base->Arg;
+  if (!Arg->getType()->isPointerTy() ||
+      Arg->getType()->getPointerAddressSpace() != 0 ||
+      Arg->hasStructRetAttr() || Arg->hasSwiftErrorAttr() ||
+      Arg->getPointeeInMemoryValueType())
+    return std::nullopt;
+  // The descriptor holds the offset of every byte as a signed 32-bit value.
+  if (Base->Offset < INT32_MIN ||
+      Base->Offset > int64_t(INT32_MAX) - int64_t(Bytes.getFixedValue()))
+    return std::nullopt;
+  return PointeeAccess{&I, Arg, Base->Offset};
+}
+
+void ModuleSanitizerCoverage::traceAccessValue(IRBuilderBase &IRB, Value *V,
+                                               int64_t Offset,
+                                               Observation &Obs) {
+  Type *Ty = V->getType();
+  if (auto *STy = dyn_cast<StructType>(Ty)) {
+    const StructLayout *Layout = DL->getStructLayout(STy);
+    for (unsigned I = 0, E = STy->getNumElements(); I != E; ++I)
+      traceAccessValue(IRB, IRB.CreateExtractValue(V, I),
+                       Offset + Layout->getElementOffset(I).getFixedValue(),
+                       Obs);
+    return;
+  }
+  if (auto *ATy = dyn_cast<ArrayType>(Ty)) {
+    uint64_t Stride = DL->getTypeAllocSize(ATy->getElementType());
+    for (unsigned I = 0, E = ATy->getNumElements(); I != E; ++I)
+      traceAccessValue(IRB, IRB.CreateExtractValue(V, I), Offset + I * Stride,
+                       Obs);
+    return;
+  }
+
+  auto Emit = [&](Value *Reported, uint64_t Size, int64_t At) {
+    Obs.Size = Size;
+    Obs.ElementOffset = static_cast<uint32_t>(static_cast<int32_t>(At));
+    uint32_t ArgIdx = AccessArgIdxFlag |
+                      uint32_t(Obs.AccessKind) << AccessArgIdxKindShift |
+                      Obs.IRArg;
+    Value *Args[] = {
+        ConstantInt::get(Int32Ty, ArgIdx), ConstantInt::get(Int32Ty, Size),
+        Reported ? Reported : ConstantInt::get(Int64Ty, 0),
+        ConstantPointerNull::get(PtrTy), ConstantInt::get(Int32Ty, 0)};
+    emitTraceCall(IRB, SanCovTraceArgsFunc, Args, Obs);
+    ++Obs.Element;
+  };
+
+  uint64_t Bytes = DL->getTypeStoreSize(Ty).getFixedValue();
+  if (Bytes <= sizeof(uint64_t)) {
+    auto [Reported, Size] = getReportedValue(IRB, V, Obs.Class);
+    Emit(Reported, Size, Offset);
+    return;
+  }
+
+  // Wider than a word: as an integer of its bits, cut into the 8-byte pieces
+  // of its bytes in memory.
+  Obs.Class = getValueClass(Ty);
+  if (!isGuaranteedNotToBeUndefOrPoison(V))
+    V = IRB.CreateFreeze(V);
+  if (auto *VTy = dyn_cast<FixedVectorType>(Ty);
+      VTy && VTy->getElementType()->isPointerTy())
+    V = IRB.CreatePtrToInt(
+        V, VectorType::get(DL->getIntPtrType(VTy->getElementType()),
+                           VTy->getElementCount()));
+  if (Ty->isPointerTy())
+    V = IRB.CreatePtrToInt(V, DL->getIntPtrType(Ty));
+  if (!V->getType()->isIntegerTy())
+    V = IRB.CreateBitCast(
+        V,
+        IRB.getIntNTy(V->getType()->getPrimitiveSizeInBits().getFixedValue()));
+  uint64_t Bits = V->getType()->getIntegerBitWidth();
+  for (uint64_t Piece = 0; Piece < Bytes; Piece += sizeof(uint64_t)) {
+    uint64_t Len = std::min<uint64_t>(Bytes - Piece, sizeof(uint64_t));
+    uint64_t Shift =
+        DL->isLittleEndian() ? 8 * Piece : Bits - 8 * (Piece + Len);
+    // Every piece starts within the value's bits: its store size is the
+    // fewest bytes holding them, and getAccessPieces() admits a big-endian
+    // value only if it fills them.
+    assert(Shift < Bits && "piece past the value");
+    Value *P = Shift ? IRB.CreateLShr(V, Shift) : V;
+    P = IRB.CreateTrunc(P, IRB.getIntNTy(std::min(8 * Len, Bits - Shift)));
+    Emit(IRB.CreateZExt(P, Int64Ty), Len, Offset + Piece);
+  }
+}
+
+void ModuleSanitizerCoverage::InjectTraceForPointeeAccesses(
+    Function &F, ArrayRef<PointeeAccess> Accesses) {
+  if (Accesses.empty())
+    return;
+  const Observation FnObs = getFunctionObservation(F);
+  for (const PointeeAccess &Access : Accesses) {
+    Instruction *I = Access.I;
+    Value *V;
+    uint8_t Kind = 0;
+    AtomicOrdering Ordering;
+    if (auto *LI = dyn_cast<LoadInst>(I)) {
+      V = LI;
+      Kind |= LI->isVolatile() ? AK_Volatile : 0;
+      Ordering = LI->getOrdering();
+    } else {
+      auto *SI = cast<StoreInst>(I);
+      V = SI->getValueOperand();
+      Kind |= AK_Store | (SI->isVolatile() ? AK_Volatile : 0);
+      Ordering = SI->getOrdering();
+    }
+    if (Ordering != AtomicOrdering::NotAtomic)
+      Kind |= AK_Atomic | uint8_t(Ordering) << AccessKindOrderingShift;
+
+    Observation Obs = FnObs;
+    Obs.Flags |= DF_Access;
+    if (getAccessPieces(*DL, V->getType()) > 1)
+      Obs.Flags |= DF_Element;
+    Obs.IRArg = Access.Arg->getArgNo();
+    Obs.AccessKind = Kind;
+    Obs.AccessSize = DL->getTypeStoreSize(V->getType()).getFixedValue();
+
+    // Right after the access, in its block: the record is made if and only if
+    // the access completed, and in the order the accesses were made. A load or
+    // store is never a terminator, so there is always an instruction after it.
+    InstrumentationIRBuilder IRB(I->getNextNode());
+    // The access's own location, but not its Key Instructions atom: the
+    // record is not a step of the source statement.
+    if (DILocation *Loc = I->getDebugLoc())
+      IRB.SetCurrentDebugLocation(
+          DILocation::get(*C, Loc->getLine(), Loc->getColumn(), Loc->getScope(),
+                          Loc->getInlinedAt(), Loc->isImplicitCode()));
+    traceAccessValue(IRB, V, Access.Offset, Obs);
   }
 }

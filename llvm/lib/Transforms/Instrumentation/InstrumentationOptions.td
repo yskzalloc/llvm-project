@@ -766,6 +766,12 @@ defm : BoolField<"sanitizer-coverage-trace-pc-entry-exit", "false",
   "PC tracing with separate entry/exit callbacks">;
 defm : BoolField<"sanitizer-coverage-trace-pc-guard", "false",
   "PC tracing with a guard">;
+defm : BoolField<"sanitizer-coverage-trace-pointee-access", "false",
+  "With trace-args, report the value of each load and store the function makes through a pointer argument at a constant offset">;
+defm : BoolField<"sanitizer-coverage-trace-pointee-access-atomic", "false",
+  "With trace-pointee-access, also report atomic loads and stores">;
+defm : BoolField<"sanitizer-coverage-trace-pointee-access-volatile", "false",
+  "With trace-pointee-access, also report volatile loads and stores">;
 defm : ValueField<"sanitizer-coverage-trace-pointee-bytes", "unsigned", "64",
   "With trace-args and trace-ret, read at most this many bytes behind a pointer the IR says is dereferenceable (0: report the pointer only)">;
 defm : BoolField<"sanitizer-coverage-trace-ret", "false",
