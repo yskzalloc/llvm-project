@@ -6,16 +6,16 @@
 ; opt runs the verifier, so a passing run also proves the emitted IR is
 ; well-formed.
 ;
-; RUN: opt < %s -passes='module(sancov-module)' -sanitizer-coverage-trace-ret -S | FileCheck %s
+; RUN: opt < %s -passes='module(sancov-module)' -sanitizer-coverage-level=1 -sanitizer-coverage-trace-ret -S | FileCheck %s
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
 %struct.S = type { i64, i64, i64 }
 
-; CHECK: @__sancov_offsets_ = private unnamed_addr constant [4 x i64] [i64 0, i64 8, i64 8, i64 4]
-; CHECK: @__sancov_offsets_.1 = private unnamed_addr constant [6 x i64] [i64 0, i64 8, i64 8, i64 8, i64 16, i64 8]
-; CHECK: @__sancov_offsets_.2 = private unnamed_addr constant [8 x i64] [i64 0, i64 8, i64 8, i64 8, i64 16, i64 8, i64 24, i64 8]
+; CHECK: @__sancov_offsets_ = private unnamed_addr constant [5 x i64] [i64 2, i64 0, i64 8, i64 8, i64 4]
+; CHECK: @__sancov_offsets_.1 = private unnamed_addr constant [7 x i64] [i64 3, i64 0, i64 8, i64 8, i64 8, i64 16, i64 8]
+; CHECK: @__sancov_offsets_.2 = private unnamed_addr constant [9 x i64] [i64 4, i64 0, i64 8, i64 8, i64 8, i64 16, i64 8, i64 24, i64 8]
 ; CHECK-NOT: @__sancov_offsets_
 
 define i32 @scalar(i32 noundef %x) {
@@ -24,7 +24,7 @@ entry:
 }
 ; CHECK-LABEL: define i32 @scalar(
 ; CHECK: %[[X:[0-9]+]] = zext i32 %x to i64
-; CHECK-NEXT: call void @__sanitizer_cov_trace_ret(i32 4, i64 %[[X]], ptr null, i32 0)
+; CHECK-NEXT: call void @__sanitizer_cov_trace_ret(i64 4, i64 %[[X]], ptr null)
 ; CHECK-NEXT: ret i32 %x
 
 ; A pointer is reported as the address it holds.
@@ -34,7 +34,7 @@ entry:
 }
 ; CHECK-LABEL: define ptr @pointer(
 ; CHECK: %[[P:[0-9]+]] = ptrtoint ptr %p to i64
-; CHECK: call void @__sanitizer_cov_trace_ret(i32 8, i64 %[[P]], ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i64 8, i64 %[[P]], ptr null)
 
 ; A pointer the return attributes say is dereferenceable at the return is
 ; reported with the bytes it points to, as rustc returns a reference: `val` is
@@ -45,7 +45,7 @@ entry:
 }
 ; CHECK-LABEL: define noundef nonnull align 4 dereferenceable(12) ptr @reference(
 ; CHECK: %[[P:[0-9]+]] = ptrtoint ptr %p to i64
-; CHECK-NEXT: call void @__sanitizer_cov_trace_ret(i32 12, i64 %[[P]], ptr @__sancov_offsets_, i32 2)
+; CHECK-NEXT: call void @__sanitizer_cov_trace_ret(i64 12, i64 %[[P]], ptr @__sancov_offsets_)
 ; CHECK-NEXT: ret ptr %p
 
 ; Every return is reported, each with its own value.
@@ -58,9 +58,9 @@ b:
   ret i64 7
 }
 ; CHECK-LABEL: define i64 @multi(
-; CHECK: call void @__sanitizer_cov_trace_ret(i32 8, i64 %x, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i64 8, i64 %x, ptr null)
 ; CHECK-NEXT: ret i64 %x
-; CHECK: call void @__sanitizer_cov_trace_ret(i32 8, i64 7, ptr null, i32 0)
+; CHECK: call void @__sanitizer_cov_trace_ret(i64 8, i64 7, ptr null)
 ; CHECK-NEXT: ret i64 7
 
 ; A struct returned in registers is reported as its elements.
@@ -71,8 +71,8 @@ entry:
   ret { i64, double } %1
 }
 ; CHECK-LABEL: define { i64, double } @aggregate(
-; CHECK: call void @__sanitizer_cov_trace_ret(i32 8,
-; CHECK: call void @__sanitizer_cov_trace_ret(i32 8,
+; CHECK: call void @__sanitizer_cov_trace_ret(i64 8,
+; CHECK: call void @__sanitizer_cov_trace_ret(i64 8,
 ; CHECK-NEXT: ret { i64, double }
 
 ; An indirect return is reported as the buffer the returned object was written
@@ -84,7 +84,7 @@ entry:
 }
 ; CHECK-LABEL: define void @indirect(
 ; CHECK: %[[R:[0-9]+]] = ptrtoint ptr %r to i64
-; CHECK-NEXT: call void @__sanitizer_cov_trace_ret(i32 24, i64 %[[R]], ptr @__sancov_offsets_.1, i32 3)
+; CHECK-NEXT: call void @__sanitizer_cov_trace_ret(i64 24, i64 %[[R]], ptr @__sancov_offsets_.1)
 ; CHECK-NEXT: ret void
 
 ; rustc types the sret buffer of a Rust-ABI function as an opaque byte array:
@@ -95,7 +95,7 @@ entry:
   ret void
 }
 ; CHECK-LABEL: define void @opaque_indirect(
-; CHECK: call void @__sanitizer_cov_trace_ret(i32 32, i64 %{{[0-9]+}}, ptr @__sancov_offsets_.2, i32 4)
+; CHECK: call void @__sanitizer_cov_trace_ret(i64 32, i64 %{{[0-9]+}}, ptr @__sancov_offsets_.2)
 
 ; A void return has nothing to report, and says so with size 0. The call is in
 ; tail position, but must not become a tail call: the runtime identifies an
@@ -105,7 +105,7 @@ entry:
   ret void
 }
 ; CHECK-LABEL: define void @void(
-; CHECK: notail call void @__sanitizer_cov_trace_ret(i32 0, i64 0, ptr null, i32 0)
+; CHECK: notail call void @__sanitizer_cov_trace_ret(i64 0, i64 0, ptr null)
 ; CHECK-NEXT: ret void
 
 ; A vector is reported as its bit pattern.
@@ -115,7 +115,7 @@ entry:
 }
 ; CHECK-LABEL: define <2 x i32> @vector(
 ; CHECK: %[[V:[0-9]+]] = bitcast <2 x i32> %v to i64
-; CHECK-NEXT: notail call void @__sanitizer_cov_trace_ret(i32 8, i64 %[[V]], ptr null, i32 0)
+; CHECK-NEXT: notail call void @__sanitizer_cov_trace_ret(i64 8, i64 %[[V]], ptr null)
 
 ; A musttail call has to stay adjacent to the return that forwards it, so that
 ; return is left alone.
@@ -142,7 +142,7 @@ lp:
   resume { ptr, i32 } %l
 }
 ; CHECK-LABEL: define i32 @unwinds(
-; CHECK: call void @__sanitizer_cov_trace_ret(i32 4,
+; CHECK: call void @__sanitizer_cov_trace_ret(i64 4,
 ; CHECK-NEXT: ret i32 %x
 ; CHECK-NOT: call void @__sanitizer_cov_trace_ret
 ; CHECK: resume

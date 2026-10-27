@@ -349,19 +349,21 @@ calls a source location and nothing else.
 
 ```c++
 // Called once per observed IR argument, or element of one, on entry.
-// arg_idx:    zero-based position of the argument in the IR parameter list
-// size:       number of bytes reported, 0 if there was nothing to report
+// tag:        (arg_idx << 32) | size, where arg_idx is the zero-based
+//             position in the IR parameter list and size is the number of
+//             bytes reported (0 if nothing to report)
 // val:        the value itself, or the address of the bytes to read
-// offsets:    table of `num_fields` [byte offset, byte size] pairs, none
-//             wider than 8 bytes, of what to read at `val`, or null
-// num_fields: number of pairs in `offsets`, 0 if `val` is a value
-void __sanitizer_cov_trace_args(uint32_t arg_idx, uint32_t size, uint64_t val,
-                                uint64_t *offsets, uint32_t num_fields);
+// offsets:    null if `val` is a value; otherwise a constant table:
+//             offsets[0] is the number of pairs N, followed by N
+//             [byte offset, byte size] pairs, none wider than 8 bytes
+void __sanitizer_cov_trace_args(uint64_t tag, uint64_t val,
+                                const uint64_t *offsets);
 
 // Called before each return; once per element of a first-class aggregate
 // return value.
-void __sanitizer_cov_trace_ret(uint32_t size, uint64_t val, uint64_t *offsets,
-                               uint32_t num_fields);
+// size:       number of bytes reported, 0 if nothing to report
+void __sanitizer_cov_trace_ret(uint64_t size, uint64_t val,
+                               const uint64_t *offsets);
 ```
 
 Neither callback is told which function it speaks for. A runtime that needs to
@@ -371,18 +373,18 @@ code address. This is the same convention as the `trace-cmp` callbacks. Every
 observation has a call of its own, which is never a tail call, so that address
 identifies it.
 
-`num_fields` says what `val` holds:
+`offsets` says what `val` holds:
 
-* `num_fields == 0`: `val` **is** the value, its low `size` bytes,
+* `offsets == nullptr`: `val` **is** the value, its low `size` bytes,
   zero-extended. Integers, pointers, floating-point values and vectors are
   reported this way: a pointer as the address it holds, a floating-point value
   or a vector as its bit pattern, and a value wider than 64 bits by its low 64
   bits.
 
-* `num_fields != 0`: `val` is the **address** of `size` bytes that may be read
-  at the call, and `offsets` says which: `num_fields` pieces, none wider than
-  8 bytes, so a consumer reading each into a 64-bit word reads all of them.
-  That is one of
+* `offsets != nullptr`: `val` is the **address** of `size` bytes that may be
+  read at the call, and `offsets` says which: `offsets[0]` pieces follow it as
+  [byte offset, byte size] pairs, none wider than 8 bytes, so a consumer reading
+  each into a 64-bit word reads all of them. That is one of
 
   * an object the ABI placed in memory, which the IR itself marks as one: an
     argument with a `byval`, `byref`, `inalloca` or `preallocated` attribute,
@@ -390,10 +392,10 @@ identifies it.
     elements of its IR type, nested structs included; anything wider than
     8 bytes - an array, or the opaque `[N x i8]` rustc types every such object
     as - in 8-byte pieces.
-  * a *pointee snapshot*: a pointer argument the IR says is
+  * a *pointee snapshot*: a `noundef` pointer argument the IR says is
     `dereferenceable(N)` or `dereferenceable_or_null(N)` on entry, or a
-    pointer return value the function's return attributes say is, at the
-    return. `val` is the pointer, and `size` is the first
+    pointer return value the function's return attributes say is (`noundef`
+    included), at the return. `val` is the pointer, and `size` is the first
     min(N, `-sanitizer-coverage-trace-pointee-bytes`) bytes it points to
     (64 by default; 0 reports every pointer by value), covered in 8-byte
     pieces. The IR attribute alone bounds the read - the IR has no pointee
@@ -464,8 +466,9 @@ only the first and the third are recorded:
 * An explicit **pointee snapshot**: bytes the runtime reads behind the pointer
   at the trace point. Only an explicit IR dereferenceability contract causes
   the instrumentation runtime to read behind a pointer:
-  `dereferenceable(N)`, or `dereferenceable_or_null(N)` with a null check, and
-  then the first min(N, `-sanitizer-coverage-trace-pointee-bytes`) bytes. The
+  `noundef` together with `dereferenceable(N)`, or with
+  `dereferenceable_or_null(N)` and a null check, and then the first
+  min(N, `-sanitizer-coverage-trace-pointee-bytes`) bytes. The
   attribute gives a bounded readable range, not a type: which members those
   bytes are is the decoder's business, with the debug information.
 * **Complete and partial values**: a member wholly within the bytes read is a

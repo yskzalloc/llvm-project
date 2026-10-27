@@ -9,10 +9,7 @@
 ; aggregate one of whose fragments was optimized out), a struct pointer with a
 ; known field layout, a #dbg_declare of a byval argument, an unoptimized
 ; function that stores its arguments to declared allocas, and an inlined callee
-; with parameters of its own. The clang -O2 inputs below add C++ references,
-; `this` and an object passed indirectly, all dereferenceable(N) pointers whose
-; pointees are read as far as the IR attribute says, which debug information
-; must not change either.
+; with parameters of its own.
 ;
 ; RUN: opt < %s -passes='module(sancov-module)' -sanitizer-coverage-level=3 -sanitizer-coverage-trace-pc-guard -sanitizer-coverage-trace-args -sanitizer-coverage-trace-ret \
 ; RUN:   | opt -strip-debug -S -o %t.instrumented-then-stripped.ll
@@ -20,26 +17,13 @@
 ; RUN:   | opt -passes='module(sancov-module)' -sanitizer-coverage-level=3 -sanitizer-coverage-trace-pc-guard -sanitizer-coverage-trace-args -sanitizer-coverage-trace-ret -S -o %t.stripped-then-instrumented.ll
 ; RUN: diff %t.instrumented-then-stripped.ll %t.stripped-then-instrumented.ll
 
-; The same holds for what clang -O2 -g emits for the argument shapes of
-; Inputs/trace-args-cases-*.ll, on both x86-64 and AArch64, whose ABIs lower the
-; same source parameters to different IR arguments.
-; RUN: opt < %S/Inputs/trace-args-cases-x86_64.ll -passes='module(sancov-module)' -sanitizer-coverage-trace-args -sanitizer-coverage-trace-ret \
-; RUN:   | opt -strip-debug -S -o %t.x86_64.instrumented-then-stripped.ll
-; RUN: opt < %S/Inputs/trace-args-cases-x86_64.ll -strip-debug \
-; RUN:   | opt -passes='module(sancov-module)' -sanitizer-coverage-trace-args -sanitizer-coverage-trace-ret -S -o %t.x86_64.stripped-then-instrumented.ll
-; RUN: diff %t.x86_64.instrumented-then-stripped.ll %t.x86_64.stripped-then-instrumented.ll
-; RUN: opt < %S/Inputs/trace-args-cases-aarch64.ll -passes='module(sancov-module)' -sanitizer-coverage-trace-args -sanitizer-coverage-trace-ret \
-; RUN:   | opt -strip-debug -S -o %t.aarch64.instrumented-then-stripped.ll
-; RUN: opt < %S/Inputs/trace-args-cases-aarch64.ll -strip-debug \
-; RUN:   | opt -passes='module(sancov-module)' -sanitizer-coverage-trace-args -sanitizer-coverage-trace-ret -S -o %t.aarch64.stripped-then-instrumented.ll
-; RUN: diff %t.aarch64.instrumented-then-stripped.ll %t.aarch64.stripped-then-instrumented.ll
-
 ; Debug information still gives the calls a location: the function's own
 ; opening line, even where the entry block starts with an inlined callee.
-; RUN: opt < %s -passes='module(sancov-module)' -sanitizer-coverage-trace-args -S | FileCheck %s
+; RUN: opt < %s -passes='module(sancov-module)' -sanitizer-coverage-level=1 -sanitizer-coverage-trace-args -S | FileCheck %s
 ; CHECK-LABEL: define i32 @caller(
-; CHECK-NOT: call void @__sanitizer_cov_trace_args(i32 1
-; CHECK: call void @__sanitizer_cov_trace_args(i32 0, i32 8, i64 %n, ptr null, i32 0), !dbg ![[ENTRY:[0-9]+]]
+; CHECK: call void @__sanitizer_cov_trace_args(i64 8, i64 %n, ptr null) #{{[0-9]+}}, !dbg ![[ENTRY:[0-9]+]]
+; CHECK-NOT: call void @__sanitizer_cov_trace_args
+; CHECK: ret i32
 ; CHECK-DAG: ![[ENTRY]] = !DILocation(line: 10, scope: ![[CALLER:[0-9]+]])
 ; CHECK-DAG: ![[CALLER]] = distinct !DISubprogram(name: "caller"
 

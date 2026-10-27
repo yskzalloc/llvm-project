@@ -13,7 +13,6 @@
 #include "llvm/Transforms/Instrumentation/SanitizerCoverage.h"
 #include "InstrumentationOptions.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/PostDominators.h"
@@ -216,36 +215,35 @@ private:
   std::string getSectionStart(const std::string &Section) const;
   std::string getSectionEnd(const std::string &Section) const;
 
-  /// The `offsets` and `num_fields` arguments of the trace-args/trace-ret
-  /// callbacks for an object in memory: a constant table of {byte offset,
-  /// byte size} pairs, none wider than 8 bytes, covering the elements of its
-  /// IR type, and the store size of that type. Table is null for an object of
-  /// no fixed size, in which case NumFields and ObjectSize are 0.
+  /// The `offsets` argument of the trace-args/trace-ret callbacks for an
+  /// object in memory: a constant table whose first element is the number of
+  /// fields, followed by [byte offset, byte size] pairs covering the elements
+  /// of its IR type, and the store size of that type. Table is null for an
+  /// object of no fixed size, in which case ObjectSize is 0.
   struct FieldOffsets {
     Constant *Table = nullptr;
-    unsigned NumFields = 0;
     uint64_t ObjectSize = 0;
   };
   FieldOffsets getObjectOffsets(Type *Ty);
-  /// Create one trace-args/trace-ret call, which is never a tail call.
+  /// Create one trace-args/trace-ret call, which is never a tail call and
+  /// cannot be merged.
   void emitTraceCall(IRBuilderBase &IRB, FunctionCallee Callee,
-                     ArrayRef<Value *> Args);
+                     std::optional<uint32_t> ArgIdx, uint64_t Size, Value *Val,
+                     Value *Table = nullptr);
   /// Emit the trace-args/trace-ret call for \p V through \p IRB: one call per
   /// element of a first-class aggregate, and one for anything else.
   void traceValue(IRBuilderBase &IRB, FunctionCallee Callee,
-                  ArrayRef<Value *> Prefix, Value *V);
+                  std::optional<uint32_t> ArgIdx, Value *V);
   void traceObject(IRBuilderBase &IRB, FunctionCallee Callee,
-                   ArrayRef<Value *> Prefix, Value *Addr, Type *Ty);
+                   std::optional<uint32_t> ArgIdx, Value *Addr, Type *Ty);
   /// Report pointer \p Ptr together with the first \p Bytes bytes it points
   /// to, which the IR says are dereferenceable.
   void tracePointee(IRBuilderBase &IRB, FunctionCallee Callee,
-                    ArrayRef<Value *> Prefix, Value *Ptr, uint64_t Bytes);
+                    std::optional<uint32_t> ArgIdx, Value *Ptr, uint64_t Bytes);
   /// How many bytes behind \p Ptr to report, given that the IR says
   /// \p Dereferenceable of them may be read: none if \p Ptr is not a pointer
   /// in the default address space.
   uint64_t getPointeeBytes(Value *Ptr, uint64_t Dereferenceable) const;
-  /// The most bytes a trace call reads behind a dereferenceable pointer.
-  uint64_t TracePointeeBytes = 0;
 
   const InstrumentationOptions &Opts;
   Module &M;
@@ -389,16 +387,7 @@ Function *ModuleSanitizerCoverage::CreateInitCallsForSections(
 }
 
 bool ModuleSanitizerCoverage::instrumentModule() {
-  // Argument and return value tracing instrument function boundaries, not
-  // blocks or edges, so they are complete on their own and do not need a
-  // coverage type. Everything the block path emits is guarded by its own
-  // option, so letting these through with SCK_None adds no block
-  // instrumentation. Without this, `opt -passes=sancov-module
-  // -sanitizer-coverage-trace-args` silently produces an uninstrumented
-  // module: the driver supplies a level when it parses
-  // -fsanitize-coverage=, but a direct pass invocation has none.
-  if (Options.CoverageType == SanitizerCoverageOptions::SCK_None &&
-      !Options.TraceArgs && !Options.TraceRet)
+  if (Options.CoverageType == SanitizerCoverageOptions::SCK_None)
     return false;
   if (Allowlist &&
       !Allowlist->inSection("coverage", "src", M.getSourceFileName()))
@@ -410,7 +399,6 @@ bool ModuleSanitizerCoverage::instrumentModule() {
   DL = &M.getDataLayout();
   CurModule = &M;
   TargetTriple = M.getTargetTriple();
-  TracePointeeBytes = Opts.sanitizer_coverage_trace_pointee_bytes;
   FunctionGuardArray = nullptr;
   Function8bitCounterArray = nullptr;
   FunctionBoolArray = nullptr;
@@ -519,14 +507,12 @@ bool ModuleSanitizerCoverage::instrumentModule() {
 
   // See the "Argument and return value tracing" section below for the meaning
   // of the arguments.
-  // void __sanitizer_cov_trace_args(u32 arg_idx, u32 size, u64 val,
-  //                                 u64 *offsets, u32 num_fields)
-  SanCovTraceArgsFunc = M.getOrInsertFunction(
-      SanCovTraceArgsName, VoidTy, Int32Ty, Int32Ty, Int64Ty, PtrTy, Int32Ty);
-  // void __sanitizer_cov_trace_ret(u32 size, u64 val,
-  //                                u64 *offsets, u32 num_fields)
+  // void __sanitizer_cov_trace_args(u64 tag, u64 val, const u64 *offsets)
+  SanCovTraceArgsFunc = M.getOrInsertFunction(SanCovTraceArgsName, VoidTy,
+                                              Int64Ty, Int64Ty, PtrTy);
+  // void __sanitizer_cov_trace_ret(u64 size, u64 val, const u64 *offsets)
   SanCovTraceRetFunc = M.getOrInsertFunction(SanCovTraceRetName, VoidTy,
-                                             Int32Ty, Int64Ty, PtrTy, Int32Ty);
+                                             Int64Ty, Int64Ty, PtrTy);
 
   SanCovStackDepthCallback =
       M.getOrInsertFunction(SanCovStackDepthCallbackName, VoidTy);
@@ -742,6 +728,11 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
   if (Options.CollectControlFlow)
     createFunctionControlFlow(F);
 
+  // Before InjectCoverage, which then puts its entry-block instrumentation
+  // ahead of the argument calls: allocas; pc_entry; trace_args.
+  if (Options.TraceArgs)
+    InjectTraceForArgs(F);
+
   Value *FunctionGateCmp = nullptr;
   InjectCoverage(F, BlocksToInstrument, FunctionGateCmp, IsLeafFunc);
   InjectCoverageForIndirectCalls(F, IndirCalls);
@@ -751,14 +742,12 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
   InjectTraceForGep(F, GepTraceTargets);
   InjectTraceForLoadsAndStores(F, Loads, Stores);
 
-  if (Options.TracePCEntryExit)
-    InjectTraceForExits(F);
-
-  if (Options.TraceArgs)
-    InjectTraceForArgs(F);
-
+  // Before InjectTraceForExits, so that a return reads trace_ret; pc_exit; ret.
   if (Options.TraceRet)
     InjectTraceForRet(F);
+
+  if (Options.TracePCEntryExit)
+    InjectTraceForExits(F);
 }
 
 GlobalVariable *ModuleSanitizerCoverage::CreateFunctionLocalArrayInSection(
@@ -1261,83 +1250,27 @@ void ModuleSanitizerCoverage::createFunctionControlFlow(Function &F) {
 
 //===----------------------------------------------------------------------===//
 // Argument and return value tracing.
+// See clang/docs/SanitizerCoverage.md for the full design and callback
+// contract:
+//   void __sanitizer_cov_trace_args(u64 tag, u64 val, const u64 *offsets);
+//   void __sanitizer_cov_trace_ret (u64 size, u64 val, const u64 *offsets);
 //===----------------------------------------------------------------------===//
-//
-// -sanitizer-coverage-trace-args reports the IR arguments of an instrumented
-// function on entry, -sanitizer-coverage-trace-ret the value of every return:
-//
-//   void __sanitizer_cov_trace_args(u32 arg_idx, u32 size, u64 val,
-//                                   u64 *offsets, u32 num_fields);
-//   void __sanitizer_cov_trace_ret (u32 size, u64 val,
-//                                   u64 *offsets, u32 num_fields);
-//
-// The instrumentation is decided by the IR alone. Debug information is never
-// consulted, so a build with -g emits exactly the same calls, with the same
-// operands, as one without it: debug information may enrich how an observation
-// is interpreted, offline, but never decides what is observed.
-//
-// An observation is identified by its call site, which the runtime reads as its
-// own return address, together with `arg_idx`. `arg_idx` is the zero-based
-// position of the argument in the IR function's parameter list - the ABI's
-// view of it, not the source-language parameter number. A struct-return
-// pointer and a Swift error slot are not observed, but keep their positions,
-// so the observed indices then have gaps. One source parameter may be several
-// IR arguments (a struct split across registers), and one IR argument several
-// observations (the elements of a first-class aggregate, which share its
-// `arg_idx`). A consumer that wants the source-level parameter maps the call
-// site and IR position back through the debug information of the binary.
-//
-// What `val` holds depends on `num_fields`:
-//
-// - `num_fields == 0`: `val` is the value itself, the low `size` bytes of it,
-//   zero-extended. Integers, pointers, floating-point values and vectors are
-//   reported this way: a pointer as the address it holds, and a floating-point
-//   value or a vector as its bit pattern. A value wider than 64 bits is
-//   reported by its low 64 bits.
-//
-// - `num_fields != 0`: `val` is the address of `size` bytes that may be read
-//   at the call, and `offsets` points at a constant table of `num_fields`
-//   {byte offset, byte size} pairs, none wider than 8 bytes, that say which of
-//   them to read. That is
-//
-//   - an object the ABI placed in memory - a byval, inalloca, preallocated or
-//     byref argument, or the buffer of an indirect (sret) return - which the
-//     table describes by the elements of its IR type, nested structs
-//     included, and anything wider than 8 bytes, such as an array or the
-//     opaque [N x i8] some front ends type every such object as, in 8-byte
-//     pieces;
-//
-//   - or a pointer argument, or a pointer return value, that the IR says is
-//     dereferenceable(N) or dereferenceable_or_null(N): `val` is the pointer
-//     and `size` the first min(N, -sanitizer-coverage-trace-pointee-bytes)
-//     bytes it points to, which the table covers in 8-byte pieces. Nothing but
-//     the IR attribute bounds the read - not the pointee's source type, which
-//     the IR does not have - so the bytes are a raw snapshot, which a consumer
-//     cuts into the pointee's members with the debug information of the
-//     binary. A dereferenceable_or_null pointer may be null, which the runtime
-//     checks for; a pointer with no such attribute is reported by value
-//     alone.
-//
-// `size == 0` means there was nothing to report - a value of a type with no
-// fixed-size bit pattern, such as a scalable vector, a void return, or an
-// object the function does not use, which its callers may pass a poison
-// pointer for. A pointer the function does not use is reported by value, its
-// pointee is not read.
-//
-// The pass never creates memory to report a value from, so no stack slot
-// escapes and no frame is realigned on its account.
 
 ModuleSanitizerCoverage::FieldOffsets
 ModuleSanitizerCoverage::getObjectOffsets(Type *Ty) {
-  if (!Ty || !Ty->isSized() || DL->getTypeStoreSize(Ty).isScalable())
+  // trace-args packs the size into the low 32 bits of its tag.
+  if (!Ty || !Ty->isSized() || DL->getTypeStoreSize(Ty).isScalable() ||
+      DL->getTypeStoreSize(Ty).getFixedValue() > UINT32_MAX)
     return {};
-  if (auto It = ObjectOffsetsCache.find(Ty); It != ObjectOffsetsCache.end())
+  auto [It, Inserted] = ObjectOffsetsCache.try_emplace(Ty);
+  if (!Inserted)
     return It->second;
 
   // A struct is described by its elements, recursively; anything else as one
   // field, or in 8-byte pieces if it is wider, so that a runtime reading every
-  // field into a 64-bit word reads all of the object.
-  SmallVector<Constant *, 16> Pairs;
+  // field into a 64-bit word reads all of the object. Element 0 is the number
+  // of pairs, filled in below.
+  SmallVector<Constant *, 17> Pairs = {nullptr};
   auto AddField = [&](uint64_t Offset, uint64_t Bytes) {
     for (uint64_t Piece = 0; Piece < Bytes; Piece += sizeof(uint64_t)) {
       Pairs.push_back(ConstantInt::get(Int64Ty, Offset + Piece));
@@ -1358,17 +1291,16 @@ ModuleSanitizerCoverage::getObjectOffsets(Type *Ty) {
   uint64_t Size = DL->getTypeStoreSize(Ty).getFixedValue();
   AddType(AddType, Ty, 0);
 
-  FieldOffsets Offsets;
-  if (!Pairs.empty()) {
+  if (Pairs.size() > 1) {
+    Pairs[0] = ConstantInt::get(Int64Ty, Pairs.size() / 2);
     ArrayType *TableTy = ArrayType::get(Int64Ty, Pairs.size());
     auto *Table = new GlobalVariable(
         M, TableTy, /*isConstant=*/true, GlobalVariable::PrivateLinkage,
         ConstantArray::get(TableTy, Pairs), "__sancov_offsets_");
     Table->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-    Offsets = {Table, static_cast<unsigned>(Pairs.size() / 2), Size};
+    It->second = {Table, Size};
   }
-  ObjectOffsetsCache[Ty] = Offsets;
-  return Offsets;
+  return It->second;
 }
 
 /// Widen \p V to the 64-bit value the callbacks take: a pointer is reported as
@@ -1423,55 +1355,53 @@ static std::pair<Value *, uint64_t> getReportedValue(IRBuilderBase &IRB,
 
 void ModuleSanitizerCoverage::emitTraceCall(IRBuilderBase &IRB,
                                             FunctionCallee Callee,
-                                            ArrayRef<Value *> Args) {
-  CallInst *CI = IRB.CreateCall(Callee, Args);
+                                            std::optional<uint32_t> ArgIdx,
+                                            uint64_t Size, Value *Val,
+                                            Value *Table) {
+  uint64_t Tag = ArgIdx ? ((uint64_t)*ArgIdx << 32) | Size : Size;
+  Value *ValArg =
+      Val ? (Val->getType()->isPointerTy() ? IRB.CreatePtrToInt(Val, Int64Ty)
+                                           : Val)
+          : ConstantInt::get(Int64Ty, 0);
+  Value *TableArg = Table ? Table : ConstantPointerNull::get(PtrTy);
+
+  CallInst *CI = IRB.CreateCall(
+      Callee, {ConstantInt::get(Int64Ty, Tag), ValArg, TableArg});
   // An observation is identified by its call site, which the runtime reads as
   // its own return address. A tail call would hand the callback the caller's
   // return address instead, and a trace-ret call of a void function is in tail
-  // position.
+  // position. Merging identical calls would conflate distinct return sites.
   CI->setTailCallKind(CallInst::TCK_NoTail);
+  CI->setCannotMerge();
 }
 
 void ModuleSanitizerCoverage::traceValue(IRBuilderBase &IRB,
                                          FunctionCallee Callee,
-                                         ArrayRef<Value *> Prefix, Value *V) {
-  auto Emit = [&](std::pair<Value *, uint64_t> Reported) {
-    SmallVector<Value *, 5> Args(Prefix);
-    Args.push_back(ConstantInt::get(Int32Ty, Reported.second));
-    Args.push_back(Reported.first ? Reported.first
-                                  : ConstantInt::get(Int64Ty, 0));
-    Args.push_back(ConstantPointerNull::get(PtrTy));
-    Args.push_back(ConstantInt::get(Int32Ty, 0));
-    emitTraceCall(IRB, Callee, Args);
-  };
-
+                                         std::optional<uint32_t> ArgIdx,
+                                         Value *V) {
   // A first-class aggregate lives in registers and has no address, so each of
   // its elements is reported on its own.
   Type *Ty = V->getType();
   unsigned NumElements = Ty->isStructTy()  ? Ty->getStructNumElements()
                          : Ty->isArrayTy() ? Ty->getArrayNumElements()
                                            : 0;
-  if (!NumElements) {
-    Emit(getReportedValue(IRB, V));
+  if (NumElements) {
+    for (unsigned I = 0; I != NumElements; ++I)
+      traceValue(IRB, Callee, ArgIdx, IRB.CreateExtractValue(V, I));
     return;
   }
-  for (unsigned I = 0; I != NumElements; ++I)
-    Emit(getReportedValue(IRB, IRB.CreateExtractValue(V, I)));
+
+  std::pair<Value *, uint64_t> Reported = getReportedValue(IRB, V);
+  emitTraceCall(IRB, Callee, ArgIdx, Reported.second, Reported.first);
 }
 
 void ModuleSanitizerCoverage::traceObject(IRBuilderBase &IRB,
                                           FunctionCallee Callee,
-                                          ArrayRef<Value *> Prefix, Value *Addr,
-                                          Type *Ty) {
+                                          std::optional<uint32_t> ArgIdx,
+                                          Value *Addr, Type *Ty) {
   FieldOffsets Offsets = getObjectOffsets(Ty);
-  SmallVector<Value *, 5> Args(Prefix);
-  Args.push_back(ConstantInt::get(Int32Ty, Offsets.ObjectSize));
-  Args.push_back(Offsets.Table ? IRB.CreatePtrToInt(Addr, Int64Ty)
-                               : ConstantInt::get(Int64Ty, 0));
-  Args.push_back(Offsets.Table ? Offsets.Table
-                               : ConstantPointerNull::get(PtrTy));
-  Args.push_back(ConstantInt::get(Int32Ty, Offsets.NumFields));
-  emitTraceCall(IRB, Callee, Args);
+  emitTraceCall(IRB, Callee, ArgIdx, Offsets.ObjectSize,
+                Offsets.Table ? Addr : nullptr, Offsets.Table);
 }
 
 uint64_t
@@ -1482,33 +1412,28 @@ ModuleSanitizerCoverage::getPointeeBytes(Value *Ptr,
   if (!Ptr->getType()->isPointerTy() ||
       Ptr->getType()->getPointerAddressSpace() != 0)
     return 0;
-  return std::min(Dereferenceable, TracePointeeBytes);
+  return std::min<uint64_t>(Dereferenceable,
+                            Opts.sanitizer_coverage_trace_pointee_bytes);
 }
 
 void ModuleSanitizerCoverage::tracePointee(IRBuilderBase &IRB,
                                            FunctionCallee Callee,
-                                           ArrayRef<Value *> Prefix, Value *Ptr,
-                                           uint64_t Bytes) {
+                                           std::optional<uint32_t> ArgIdx,
+                                           Value *Ptr, uint64_t Bytes) {
   // The IR says nothing about the pointee but how many bytes of it may be
   // read, so they are read as bytes: the table of a byte array that long.
   FieldOffsets Offsets =
       getObjectOffsets(ArrayType::get(IRB.getInt8Ty(), Bytes));
-  if (!isGuaranteedNotToBeUndefOrPoison(Ptr))
-    Ptr = IRB.CreateFreeze(Ptr);
-  SmallVector<Value *, 5> Args(Prefix);
-  Args.push_back(ConstantInt::get(Int32Ty, Offsets.ObjectSize));
-  Args.push_back(IRB.CreatePtrToInt(Ptr, Int64Ty));
-  Args.push_back(Offsets.Table);
-  Args.push_back(ConstantInt::get(Int32Ty, Offsets.NumFields));
-  emitTraceCall(IRB, Callee, Args);
+  emitTraceCall(IRB, Callee, ArgIdx, Offsets.ObjectSize, Ptr, Offsets.Table);
 }
 
 void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
+  // Static allocas stay first in the entry block. This runs before
+  // InjectCoverage, whose entry-block instrumentation (pc_entry, trace_pc,
+  // the guard or counter) is then inserted ahead of these calls.
   BasicBlock &EntryBB = F.getEntryBlock();
-  BasicBlock::iterator IP = EntryBB.getFirstInsertionPt();
-  // A function whose entry block admits no call cannot be reported at all.
-  if (IP == EntryBB.end())
-    return;
+  BasicBlock::iterator IP =
+      PrepareToSplitEntryBlock(EntryBB, EntryBB.getFirstInsertionPt());
 
   // InstrumentationIRBuilder gives the calls a !dbg location, which the
   // verifier requires of a call in a function with debug information once it
@@ -1521,12 +1446,6 @@ void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
     IRB.SetCurrentDebugLocation(
         DILocation::get(SP->getContext(), SP->getScopeLine(), 0, SP));
 
-  // Whether the function uses each argument, before the calls use them all.
-  // Callers may pass anything for one it does not: a value is still reported,
-  // but an object is not read.
-  SmallBitVector Unused(F.arg_size());
-  for (Argument &Arg : F.args())
-    Unused[Arg.getArgNo()] = Arg.use_empty();
   for (Argument &Arg : F.args()) {
     // A struct-return pointer is where the return value goes, which trace-ret
     // reports; the error slot of a Swift throwing function may only be loaded,
@@ -1534,28 +1453,33 @@ void ModuleSanitizerCoverage::InjectTraceForArgs(Function &F) {
     // neither renumbers the arguments that are: arg_idx stays the IR position.
     if (Arg.hasStructRetAttr() || Arg.hasSwiftErrorAttr())
       continue;
-    Value *Prefix[] = {ConstantInt::get(Int32Ty, Arg.getArgNo())};
+    // Callers may pass anything for an argument the function does not use: a
+    // value is still reported, but an object is not read.
+    bool Unused = Arg.use_empty();
+    uint32_t ArgIdx = Arg.getArgNo();
     // An argument the ABI says points at a copy of the parameter in memory is
     // that object, not a value.
     // An object the function does not use may be passed as a poison pointer,
     // by dead argument elimination in its callers: it is not handed to the
     // runtime to read.
     if (Type *MemTy = Arg.getPointeeInMemoryValueType()) {
-      traceObject(IRB, SanCovTraceArgsFunc, Prefix,
-                  Unused[Arg.getArgNo()] ? nullptr : &Arg,
-                  Unused[Arg.getArgNo()] ? nullptr : MemTy);
+      traceObject(IRB, SanCovTraceArgsFunc, ArgIdx, Unused ? nullptr : &Arg,
+                  Unused ? nullptr : MemTy);
     } else if (uint64_t Bytes =
-                   !Arg.getType()->isPointerTy() || Unused[Arg.getArgNo()]
-                       ? 0
-                       : getPointeeBytes(
-                             &Arg,
-                             std::max(Arg.getDereferenceableBytes(),
-                                      Arg.getDereferenceableOrNullBytes()))) {
+                   // Argument::getDereferenceableBytes() asserts on a
+                   // non-pointer. Without noundef the pointer may be poison,
+                   // which no freeze makes safe to read through.
+               Unused || !Arg.getType()->isPointerTy() ||
+                       !Arg.hasAttribute(Attribute::NoUndef)
+                   ? 0
+                   : getPointeeBytes(
+                         &Arg, std::max(Arg.getDereferenceableBytes(),
+                                        Arg.getDereferenceableOrNullBytes()))) {
       // What the pointer points to, as far as the IR says it may be read: at
       // the top of the entry block nothing can have freed it yet.
-      tracePointee(IRB, SanCovTraceArgsFunc, Prefix, &Arg, Bytes);
+      tracePointee(IRB, SanCovTraceArgsFunc, ArgIdx, &Arg, Bytes);
     } else {
-      traceValue(IRB, SanCovTraceArgsFunc, Prefix, &Arg);
+      traceValue(IRB, SanCovTraceArgsFunc, ArgIdx, &Arg);
     }
   }
 }
@@ -1576,7 +1500,7 @@ void ModuleSanitizerCoverage::InjectTraceForRet(Function &F) {
   // A returned pointer the IR says may be read from is reported with what it
   // points to: the return attribute holds where the function returns.
   uint64_t RetPointeeBytes =
-      F.getReturnType()->isPointerTy() && !SRetArg
+      F.hasRetAttribute(Attribute::NoUndef)
           ? std::max(F.getAttributes().getRetDereferenceableBytes(),
                      F.getAttributes().getRetDereferenceableOrNullBytes())
           : 0;
@@ -1594,16 +1518,16 @@ void ModuleSanitizerCoverage::InjectTraceForRet(Function &F) {
 
     InstrumentationIRBuilder IRB(RI);
     if (SRetArg) {
-      traceObject(IRB, SanCovTraceRetFunc, {}, SRetUnused ? nullptr : SRetArg,
+      traceObject(IRB, SanCovTraceRetFunc, std::nullopt,
+                  SRetUnused ? nullptr : SRetArg,
                   SRetUnused ? nullptr : SRetArg->getParamStructRetType());
     } else if (Value *RetVal = RI->getReturnValue()) {
-      if (uint64_t Bytes =
-              RetPointeeBytes ? getPointeeBytes(RetVal, RetPointeeBytes) : 0)
-        tracePointee(IRB, SanCovTraceRetFunc, {}, RetVal, Bytes);
+      if (uint64_t Bytes = getPointeeBytes(RetVal, RetPointeeBytes))
+        tracePointee(IRB, SanCovTraceRetFunc, std::nullopt, RetVal, Bytes);
       else
-        traceValue(IRB, SanCovTraceRetFunc, {}, RetVal);
+        traceValue(IRB, SanCovTraceRetFunc, std::nullopt, RetVal);
     } else {
-      traceObject(IRB, SanCovTraceRetFunc, {}, nullptr, nullptr); // void
+      emitTraceCall(IRB, SanCovTraceRetFunc, std::nullopt, 0, nullptr); // void
     }
   }
 }

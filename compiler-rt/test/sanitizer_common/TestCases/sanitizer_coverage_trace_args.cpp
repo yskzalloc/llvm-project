@@ -21,19 +21,20 @@ extern "C" {
 void __sanitizer_cov_trace_pc_guard(uint32_t *) {}
 void __sanitizer_cov_trace_pc_guard_init(uint32_t *, uint32_t *) {}
 
-// The consumers under test. A size of zero means the instrumentation had
-// nothing to report, and a non-zero num_fields would mean `val` is an address
-// rather than a value. Neither callback is passed the function it speaks for;
-// a consumer that wants it takes its own return address.
-void __sanitizer_cov_trace_args(uint32_t arg_idx, uint32_t size, uint64_t val,
-                                uint64_t *offsets, uint32_t num_fields) {
-  if (size == sizeof(int) && !num_fields)
+// The consumers under test. A null `offsets` means `val` is the value; a size
+// of zero means the instrumentation had nothing to report. Neither callback is
+// passed the function it speaks for; a consumer that wants it takes its own
+// return address.
+void __sanitizer_cov_trace_args(uint64_t tag, uint64_t val,
+                                const uint64_t *offsets) {
+  uint32_t arg_idx = tag >> 32, size = (uint32_t)tag;
+  if (size == sizeof(int) && !offsets)
     fprintf(stderr, "ARG idx=%u val=%d\n", arg_idx, (int)val);
 }
 
-void __sanitizer_cov_trace_ret(uint32_t size, uint64_t val, uint64_t *offsets,
-                               uint32_t num_fields) {
-  if (size == sizeof(int) && !num_fields)
+void __sanitizer_cov_trace_ret(uint64_t size, uint64_t val,
+                               const uint64_t *offsets) {
+  if (size == sizeof(int) && !offsets)
     fprintf(stderr, "RET val=%d\n", (int)val);
 }
 }
